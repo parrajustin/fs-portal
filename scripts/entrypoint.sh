@@ -115,8 +115,25 @@ fi
 
 # ---- import role ----------------------------------------------------------
 if [[ " $ROLES_ACTIVE " == *" import "* ]]; then
+  # Wait (don't die) for the peer's ticket: both computers can boot before
+  # tickets have been exchanged. Accept the PEER_TICKET env or a
+  # $CONFIG_DIR/peer_ticket file that may appear at any time.
   PEER_TICKET="${PEER_TICKET:-$(cat "$CONFIG_DIR/peer_ticket" 2>/dev/null)}"
-  [[ -n "${PEER_TICKET:-}" ]] || die "PEER_TICKET is required for the import role. Run the other side first, copy the ticket it prints (or its /config/ticket.txt), and set PEER_TICKET (or put it in $CONFIG_DIR/peer_ticket)."
+  if [[ -z "${PEER_TICKET:-}" ]]; then
+    log "import: waiting for peer ticket. Copy the ticket printed by the OTHER computer's fs-portal (also in its /config/ticket.txt) and either set PEER_TICKET in the environment (then recreate this container) or write it to $CONFIG_DIR/peer_ticket (picked up live)."
+    i=0
+    while [[ -z "${PEER_TICKET:-}" ]]; do
+      sleep 5
+      PEER_TICKET="$(cat "$CONFIG_DIR/peer_ticket" 2>/dev/null)"
+      i=$((i + 1))
+      (( i % 12 == 0 )) && log "import: still waiting for $CONFIG_DIR/peer_ticket ..."
+    done
+    log "import: peer ticket received"
+  fi
+  # tolerate sloppy pastes: pull the bare base32 token out of whatever we got
+  # (full "dumbpipe connect-tcp <ticket>" lines, stray whitespace, ...)
+  PEER_TICKET="$(printf '%s\n' "$PEER_TICKET" | fsp_parse_ticket)"
+  [[ -n "$PEER_TICKET" ]] || die "PEER_TICKET did not contain a valid dumbpipe ticket"
 
   mkdir -p "$MOUNT_DIR" "$FSP_CACHE_DIR"
   # clear any stale mount from an unclean shutdown
