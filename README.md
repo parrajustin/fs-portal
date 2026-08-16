@@ -77,6 +77,54 @@ Both computers do the same thing; only the compose file differs
    `/friend-media/media`; in jellyfin add `/data/friend-media/media`.
    Restart plex/jellyfin once if the folder was empty when they started.
 
+## Modes
+
+`ROLES` picks what this fs-portal instance does (`transmitter`/`receiver`/
+`both`; `export`/`import` are accepted synonyms, comma-combinable,
+case-insensitive):
+
+| Mode | What runs | Use when |
+| --- | --- | --- |
+| `both` (default) | serve your library **and** mount theirs | the normal two-way setup in the compose examples |
+| `transmitter` | serve your library over iroh + print your ticket; no FUSE mount | you share but don't want their library (e.g. a seedbox/NAS that only feeds a friend) |
+| `receiver` | mount their library only; mints no ticket, needs `PEER_TICKET` | a box that only consumes (e.g. a travel/HTPC machine), or a 3rd machine mounting an existing transmitter |
+
+**A pure `transmitter` needs no FUSE privileges at all.** `SYS_ADMIN`,
+`/dev/fuse`, `apparmor:unconfined`, and the `:rshared` portal bind exist only
+for the *mount* (receiver) side. A transmitter-only service trims down to:
+
+```yaml
+  fs-portal:
+    image: fs-portal:latest
+    container_name: fs-portal
+    restart: always
+    environment:
+      - ROLES=transmitter
+      - IROH_SECRET=${FS_PORTAL_SECRET}
+    volumes:
+      - /path/to/your/media:/export:ro
+      - ${FS_PORTAL_ROOT}/config:/config
+    # no cap_add, no devices, no security_opt, no portal/cache volumes
+```
+
+Least privilege per mode:
+
+| | `transmitter` | `receiver` | `both` |
+| --- | --- | --- | --- |
+| `cap_add: SYS_ADMIN` + `devices: /dev/fuse` + `apparmor:unconfined` | — | required | required |
+| `…/portal:/portal:rshared` volume | — | required | required |
+| `…/cache:/cache` volume | — | recommended | recommended |
+| `/export` bind (`:ro`) | required | — | required |
+| `IROH_SECRET` / `/config` | required (ticket identity) | recommended¹ | required |
+| `PEER_TICKET` | — | required | required |
+
+¹ a receiver works without a stable secret (it mints no ticket anyone dials),
+but keeping `/config` mounted avoids a fresh node id on every boot.
+
+The healthcheck adapts automatically: it only probes the pieces the chosen
+mode runs. Single modes are exercised on every integration run (the test
+exporter is `ROLES=export`, the importer `ROLES=import`).
+
 ## Guarantees
 
 - **Read-only, three layers deep**: the WebDAV export is `--read-only`, the
