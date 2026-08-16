@@ -1,3 +1,11 @@
 {
-  "version": 1
+  "latest_version": 0,
+  "versions": [
+    {
+      "version": 0,
+      "digests": {
+        "x86_64": "sha256:3974d32330cdcea60c1e5b458fb13d8b57a5ea2a89b8e983b3664c092de845f7"
+      }
+    }
+  ]
 }

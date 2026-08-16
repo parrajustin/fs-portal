@@ -8,6 +8,17 @@
 # dumbpipe is compiled from the vendored Rust source (vendor/dumbpipe), so an
 # arm64 build on an x86 host runs under QEMU emulation and takes a long time.
 #
+# version.json records the release history:
+#   {
+#     "latest_version": <N>,
+#     "versions": [
+#       {"version": <N>, "digests": {"x86_64": "sha256:...", "aarch64": "sha256:..."}},
+#       ...
+#     ]
+#   }
+# It is only updated after every push has succeeded, so a failed release
+# does not burn a version number.
+#
 # Requires `docker login` for the xerofuzzion account.
 
 # -E so the ERR trap also fires for failures inside functions/subshells
@@ -18,7 +29,7 @@ cd "$(dirname "$0")"
 
 IMAGE_NAME="xerofuzzion/fs-portal"
 
-# File containing the version
+# File containing the version history
 VERSION_FILE="version.json"
 
 BUILD_ARM64=0
@@ -41,16 +52,19 @@ done
 
 # Check if version.json exists, if not initialize it
 if [ ! -f "$VERSION_FILE" ]; then
-  echo '{"version": -1}' > "$VERSION_FILE"
+  echo '{"latest_version": -1, "versions": []}' > "$VERSION_FILE"
 fi
 
-# Read current version
-CURRENT_VERSION=$(jq -r '.version' "$VERSION_FILE")
+# Read current version (".version" fallback migrates the old flat format)
+CURRENT_VERSION=$(jq -r '.latest_version // .version // -1' "$VERSION_FILE")
 
 # Increment version
 NEW_VERSION=$((CURRENT_VERSION + 1))
 
 TAGNAME="v${NEW_VERSION}"
+
+METADATA_DIR=$(mktemp -d)
+trap 'rm -rf "$METADATA_DIR"' EXIT
 
 build_and_push() {
   local platform="$1"
@@ -59,7 +73,13 @@ build_and_push() {
   docker buildx build \
     --platform "$platform" \
     -t "${IMAGE_NAME}:${TAGNAME}-${arch}" -t "${IMAGE_NAME}:latest-${arch}" \
+    --metadata-file "${METADATA_DIR}/${arch}.json" \
     --output type=image,push=true,compression=zstd,force-compression=true,compression-level=3 .
+}
+
+# sha256 digest of the pushed image for an arch, from buildx metadata
+pushed_digest() {
+  jq -r '."containerimage.digest"' "${METADATA_DIR}/$1.json"
 }
 
 build_and_push linux/amd64 x86_64
@@ -70,12 +90,23 @@ else
   echo "Skipping aarch64 — pass --arm64 to build it."
 fi
 
-# version.json is only bumped after every push has succeeded, so a failed
-# release does not burn a version number.
-jq --arg v "$NEW_VERSION" '.version = ($v | tonumber)' "$VERSION_FILE" > version.tmp.json && mv version.tmp.json "$VERSION_FILE"
-
-echo "Successfully built and pushed ${IMAGE_NAME}:${TAGNAME}-x86_64 (and latest-x86_64)"
+DIGEST_X86=$(pushed_digest x86_64)
+DIGEST_ARM=""
 if [ "$BUILD_ARM64" -eq 1 ]; then
-  echo "Successfully built and pushed ${IMAGE_NAME}:${TAGNAME}-aarch64 (and latest-aarch64)"
+  DIGEST_ARM=$(pushed_digest aarch64)
 fi
-echo "version.json updated to version ${NEW_VERSION}"
+
+# Record the release (migrating any old flat {"version": N} file shape).
+jq --arg v "$NEW_VERSION" --arg dx "$DIGEST_X86" --arg da "$DIGEST_ARM" '
+  {latest_version: ($v | tonumber), versions: (.versions // [])}
+  | .versions += [{
+      version: ($v | tonumber),
+      digests: ({x86_64: $dx} + (if $da != "" then {aarch64: $da} else {} end))
+    }]
+' "$VERSION_FILE" > version.tmp.json && mv version.tmp.json "$VERSION_FILE"
+
+echo "Successfully built and pushed ${IMAGE_NAME}:${TAGNAME}-x86_64 (and latest-x86_64): ${DIGEST_X86}"
+if [ "$BUILD_ARM64" -eq 1 ]; then
+  echo "Successfully built and pushed ${IMAGE_NAME}:${TAGNAME}-aarch64 (and latest-aarch64): ${DIGEST_ARM}"
+fi
+echo "version.json updated: latest_version=${NEW_VERSION}"
