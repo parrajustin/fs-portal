@@ -34,12 +34,17 @@ Both computers do the same thing; only the compose file differs
 1. **Get the image** onto each computer (any one of):
 
    ```sh
-   # from this repo checkout
-   docker build -t fs-portal:latest tools/fs-portal
+   # from Docker Hub (published by release.sh)
+   docker pull xerofuzzion/fs-portal:latest-x86_64
+   # …or build from this repo checkout
+   docker build -t fs-portal:latest .
    # …or build on one machine and carry it over
    docker save fs-portal:latest | gzip > fs-portal.tar.gz   # sender
    docker load < fs-portal.tar.gz                            # receiver
    ```
+
+   Releases are cut with `./release.sh` (pushes `v<N>-x86_64` and
+   `latest-x86_64`; add `--arm64` for aarch64, slow under QEMU).
 
 2. **Add to `.env`** (next to your existing compose `.env`):
 

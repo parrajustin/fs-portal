@@ -10,7 +10,7 @@
 name: Services
 services:
   fs-portal:
-    image: fs-portal:latest # build once: docker build -t fs-portal:latest ./fs-portal
+    image: xerofuzzion/fs-portal:latest-x86_64 # or build locally: docker build -t fs-portal .
     container_name: service-fs-portal
     restart: always
     environment:
