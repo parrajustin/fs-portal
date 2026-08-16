@@ -1,0 +1,61 @@
+# Computer A — the jellyfin side.
+# fs-portal exports YOUR library over iroh and mounts your friend's library
+# at ${FS_PORTAL_ROOT}/portal/media on the host; jellyfin sees it read-only
+# at /data/friend-media/media.
+#
+# .env you need (see README.md):
+#   FS_PORTAL_SECRET=<openssl rand -hex 32>          # fixed identity, never share
+#   FS_PORTAL_PEER_TICKET=<ticket from computer B>   # empty on first boot
+#   FS_PORTAL_ROOT=/opt/fs-portal                    # any host dir
+#   UPLOAD_LOCATION=...                              # same as your jellyfin .env
+version: "3"
+services:
+  fs-portal:
+    image: fs-portal:latest # build once: docker build -t fs-portal:latest ./fs-portal
+    container_name: fs-portal
+    restart: always
+    environment:
+      - ROLES=export,import
+      - IROH_SECRET=${FS_PORTAL_SECRET}
+      - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-}
+    volumes:
+      # everything under /export is what your friend will see (read-only)
+      - ${UPLOAD_LOCATION}:/export:ro
+      # their library lands here and propagates to the host + jellyfin
+      - ${FS_PORTAL_ROOT}/portal:/portal:rshared
+      - ${FS_PORTAL_ROOT}/config:/config
+      - ${FS_PORTAL_ROOT}/cache:/cache
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+
+  jellyfin:
+    image: jellyfin/jellyfin
+    container_name: jellyfin
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=US/Pacific
+      - JELLYFIN_FFmpeg__analyzeduration=50m
+    volumes:
+      - ${APP_DATA_LOCATION}/jellyfin_config:/config
+      - ${UPLOAD_LOCATION}/tvshows:/data/tvshows
+      - ${UPLOAD_LOCATION}/movies:/data/movies
+      - ${UPLOAD_LOCATION}/anime:/data/anime
+      - ${UPLOAD_LOCATION}/donghua:/data/donghua
+      - ${UPLOAD_LOCATION}/cache:/cache
+      # NEW: your friend's plex library, read-only, survives fs-portal
+      # restarts thanks to rslave. Add /data/friend-media/media as a library.
+      - ${FS_PORTAL_ROOT}/portal:/data/friend-media:rslave
+    ports:
+      - 8096:8096
+    restart: unless-stopped
+    depends_on:
+      - fs-portal
+    deploy:
+      resources:
+        limits:
+          memory: 6G

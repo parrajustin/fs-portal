@@ -1,0 +1,59 @@
+# Computer B — the plex side (unraid).
+# fs-portal exports /mnt/user/video over iroh and mounts your friend's
+# library at ${FS_PORTAL_ROOT}/portal/media on the host; plex sees it
+# read-only at /friend-media/media.
+#
+# .env you need (see README.md):
+#   FS_PORTAL_SECRET=<openssl rand -hex 32>          # fixed identity, never share
+#   FS_PORTAL_PEER_TICKET=<ticket from computer A>   # empty on first boot
+#   FS_PORTAL_ROOT=/mnt/cache_ssd/appdata/fs-portal
+name: Services
+services:
+  fs-portal:
+    image: fs-portal:latest # build once: docker build -t fs-portal:latest ./fs-portal
+    container_name: service-fs-portal
+    restart: always
+    environment:
+      - ROLES=export,import
+      - IROH_SECRET=${FS_PORTAL_SECRET}
+      - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-}
+    volumes:
+      # everything under /export is what your friend will see (read-only)
+      - /mnt/user/video/:/export:ro
+      # their library lands here and propagates to the host + plex
+      - ${FS_PORTAL_ROOT}/portal:/portal:rshared
+      - ${FS_PORTAL_ROOT}/config:/config
+      - ${FS_PORTAL_ROOT}/cache:/cache
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    container_name: service-plex
+    network_mode: host
+    labels:
+      net.unraid.docker.icon: https://cdn.jsdelivr.net/gh/selfhst/icons@main/png/plex.png
+      net.unraid.docker.webui: http://192.168.49.49:32400
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=America/Chicago
+      - VERSION=docker
+      - PLEX_CLAIM=${PLEX_CLAIM_VAR}
+    volumes:
+      - /mnt/cache_ssd/appdata/plex-20260811:/config
+      - /mnt/cache_ssd/transcode/:/transcode
+      - /mnt/user/video/:/data
+      # NEW: your friend's jellyfin library, read-only, survives fs-portal
+      # restarts thanks to rslave. Add /friend-media/media as a library
+      # folder in plex.
+      - ${FS_PORTAL_ROOT}/portal:/friend-media:rslave
+    devices:
+      - /dev/dri:/dev/dri
+    restart: always
+    depends_on:
+      - fs-portal

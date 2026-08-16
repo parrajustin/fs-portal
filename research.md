@@ -170,8 +170,23 @@ back through a host dir is not representative of a real Linux docker host
 (unraid etc.). The e2e therefore runs the whole two-computer topology inside
 a privileged `docker:dind` container: a genuine Linux dockerd where
 `rshared`/`rslave` behave exactly as they will in production. Inside dind the
-two "computers" get **isolated bridge networks** so the only path between
-them is iroh.
+two "computers" get separate bridge networks plus a shared "wan" bridge on
+the portals only, so iroh connects over its direct path and the test is
+deterministic; all application traffic still rides iroh QUIC.
+
+**Empirical finding (relay-only mode):** with *fully* isolated bridges the
+peers can only meet via n0's public relays. That worked only intermittently
+from this rig, and debug logs show why: both peers sit behind the same
+double NAT whose mapping "varies by destination" (symmetric NAT → hole
+punching impossible), both share one external IP, and the test churns
+through many short-lived node ids from that IP, which the public relay
+infrastructure eventually throttles (`error: connection lost` immediately
+after handshake). A DNS-discovery lookup and a relayed handshake were both
+observed succeeding, so the path itself functions — it is the shared-IP
+test topology that is pathological, not the design. Two real houses have
+distinct IPs and ordinary NATs, which is exactly iroh's target scenario.
+The relay-only variant is kept as `E2E_ISOLATED=1` for manual runs on
+genuinely distinct networks.
 
 ## Sources
 
