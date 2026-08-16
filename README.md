@@ -97,22 +97,82 @@ case-insensitive):
 | `transmitter` | serve your library over iroh + print your ticket; no FUSE mount | you share but don't want their library (e.g. a seedbox/NAS that only feeds a friend) |
 | `receiver` | mount their library only; mints no ticket, needs `PEER_TICKET` | a box that only consumes (e.g. a travel/HTPC machine), or a 3rd machine mounting an existing transmitter |
 
+### Example: `transmitter` (share only)
+
 **A pure `transmitter` needs no FUSE privileges at all.** `SYS_ADMIN`,
 `/dev/fuse`, `apparmor:unconfined`, and the `:rshared` portal bind exist only
-for the *mount* (receiver) side. A transmitter-only service trims down to:
+for the *mount* (receiver) side. It prints/persists your ticket and serves
+your library read-only over iroh — nothing else:
 
 ```yaml
+services:
   fs-portal:
-    image: fs-portal:latest
+    image: xerofuzzion/fs-portal:latest-x86_64
     container_name: fs-portal
     restart: always
     environment:
       - ROLES=transmitter
-      - IROH_SECRET=${FS_PORTAL_SECRET}
+      - IROH_SECRET=${FS_PORTAL_SECRET} # openssl rand -hex 32
     volumes:
       - /path/to/your/media:/export:ro
-      - ${FS_PORTAL_ROOT}/config:/config
+      - ${FS_PORTAL_ROOT}/config:/config # keeps identity + ticket.txt
     # no cap_add, no devices, no security_opt, no portal/cache volumes
+```
+
+### Example: `receiver` (mount only)
+
+Mints no ticket of its own; it just mounts the transmitter's library at
+`${FS_PORTAL_ROOT}/portal/media` on the host for your media server (which
+adds `- ${FS_PORTAL_ROOT}/portal:/friend-media:rslave` and uses
+`/friend-media/media`):
+
+```yaml
+services:
+  fs-portal:
+    image: xerofuzzion/fs-portal:latest-x86_64
+    container_name: fs-portal
+    restart: always
+    environment:
+      - ROLES=receiver
+      - PEER_TICKET=${FS_PORTAL_PEER_TICKET} # ticket from the transmitter
+    volumes:
+      - ${FS_PORTAL_ROOT}/portal:/portal:rshared
+      - ${FS_PORTAL_ROOT}/config:/config
+      - ${FS_PORTAL_ROOT}/cache:/cache
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
+```
+
+### Example: `both` (two-way, the usual setup)
+
+Union of the two: your media in, their media out. This is what the full
+stacks in [compose/](compose/) use:
+
+```yaml
+services:
+  fs-portal:
+    image: xerofuzzion/fs-portal:latest-x86_64
+    container_name: fs-portal
+    restart: always
+    environment:
+      - ROLES=both
+      - IROH_SECRET=${FS_PORTAL_SECRET}
+      - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-} # empty on first boot
+    volumes:
+      - /path/to/your/media:/export:ro
+      - ${FS_PORTAL_ROOT}/portal:/portal:rshared
+      - ${FS_PORTAL_ROOT}/config:/config
+      - ${FS_PORTAL_ROOT}/cache:/cache
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    security_opt:
+      - apparmor:unconfined
 ```
 
 Least privilege per mode:
