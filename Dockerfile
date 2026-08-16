@@ -2,23 +2,21 @@
 # fs-portal: expose a local media library to a remote peer over iroh, and
 # FUSE-mount the peer's library locally (read-only) for sibling containers.
 
-FROM alpine:3.22 AS dumbpipe
-ARG DUMBPIPE_VERSION=v0.39.0
-ARG TARGETARCH
-RUN apk add --no-cache curl tar
-RUN set -eux; \
-    case "$TARGETARCH" in \
-      amd64) arch=x86_64 ;; \
-      arm64) arch=aarch64 ;; \
-      *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL -o /tmp/dumbpipe.tar.gz \
-      "https://github.com/n0-computer/dumbpipe/releases/download/${DUMBPIPE_VERSION}/dumbpipe-${DUMBPIPE_VERSION}-linux-${arch}.tar.gz"; \
-    mkdir /tmp/out; \
-    tar -xzf /tmp/dumbpipe.tar.gz -C /tmp/out; \
-    find /tmp/out -type f -name dumbpipe -exec mv {} /usr/local/bin/dumbpipe \; ; \
-    chmod +x /usr/local/bin/dumbpipe; \
-    /usr/local/bin/dumbpipe --version || true
+# dumbpipe is built from the vendored source in vendor/dumbpipe (see its
+# UPSTREAM file) — no dependency on upstream's mutable release binaries.
+# Dependency versions are pinned by the committed Cargo.lock (--locked).
+FROM rust:1.93-alpine AS dumbpipe
+RUN apk add --no-cache musl-dev
+COPY vendor/dumbpipe /build
+WORKDIR /build
+RUN cargo build --release --locked \
+ && cp target/release/dumbpipe /usr/local/bin/dumbpipe \
+ && /usr/local/bin/dumbpipe --help >/dev/null
+
+# `docker build --target dumbpipe-test .` runs upstream's own test suite
+# against the vendored source; wired into test.sh, not part of the image.
+FROM dumbpipe AS dumbpipe-test
+RUN cargo test --release --locked 2>&1 | tee /tmp/cargo-test.log
 
 FROM rclone/rclone:1.71
 RUN apk add --no-cache bash fuse3 \

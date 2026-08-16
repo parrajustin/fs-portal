@@ -99,8 +99,13 @@ is iroh's official "netcat over iroh" tool:
   behind NAT is fine) and falls back to n0's public relays when punching
   fails. The ticket embeds node id + relay + last-known direct addrs; only
   the node id matters long-term (discovery finds current addrs).
-- Prebuilt static binaries: `dumbpipe-v0.39.0-linux-{x86_64,aarch64}.tar.gz`
-  (latest release v0.39.0 at time of writing).
+- Small, auditable surface: the whole tool is `src/lib.rs` + `src/main.rs` +
+  `tests/cli.rs` (~1.4k lines). We **vendor the v0.39.0 source** under
+  `vendor/dumbpipe/` (sha256-verified tarball, licenses + `UPSTREAM`
+  provenance file, deps pinned by the committed `Cargo.lock`) and build it
+  with `cargo build --release --locked` in the Dockerfile — no reliance on
+  upstream's mutable release binaries. Upstream's own test suite runs via
+  the `dumbpipe-test` build target (wired into `test.sh`).
 - Security model: possession of the ticket (node id) is the credential. The
   export is read-only at the rclone layer; additionally rclone WebDAV auth
   (user/pass) can be layered on via env if desired.

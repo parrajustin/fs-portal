@@ -7,6 +7,9 @@ echo "########## unit ##########"
 bash -n "$HERE/scripts/lib.sh" && bash -n "$HERE/scripts/entrypoint.sh" && bash -n "$HERE/scripts/healthcheck.sh" || exit 1
 "$HERE/test/unit/run.sh" || exit 1
 
+echo "########## vendored dumbpipe (cargo test) ##########"
+docker build --target dumbpipe-test "$HERE" || exit 1
+
 echo "########## integration ##########"
 "$HERE/test/integration/run.sh" || exit 1
 

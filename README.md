@@ -18,6 +18,9 @@ media ──▶ fs-portal ◀═════════════════
 Under the hood: `rclone serve webdav --read-only` (localhost-only) is tunneled
 out by `dumbpipe listen-tcp` (iroh); the other side bridges it back with
 `dumbpipe connect-tcp` and FUSE-mounts it with `rclone mount --read-only`.
+dumbpipe is **built from source vendored in [vendor/dumbpipe/](vendor/dumbpipe/)**
+(pinned tag + `Cargo.lock`, provenance in its `UPSTREAM` file) — the image
+never downloads upstream release binaries.
 The FUSE mount propagates to sibling containers via the standard
 `rshared`/`rslave` bind pattern. Full rationale and alternatives considered:
 [research.md](research.md).

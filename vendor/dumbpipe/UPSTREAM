@@ -1,0 +1,16 @@
+Vendored copy of dumbpipe, built from source by the fs-portal Dockerfile so
+we do not depend on upstream's mutable release binaries.
+
+Upstream:  https://github.com/n0-computer/dumbpipe
+Tag:       v0.39.0
+Source:    https://github.com/n0-computer/dumbpipe/archive/refs/tags/v0.39.0.tar.gz
+sha256:    89d01b0b6d25fc8baf06ab791fd0a2b35b24ac51d0bd01b64d36c35750aaf3e9
+License:   MIT OR Apache-2.0 (LICENSE-MIT / LICENSE-APACHE alongside)
+Vendored:  2026-08-15; contents are the tag's src/, tests/, Cargo.toml,
+           Cargo.lock, licenses and README, unmodified. .github/ and
+           .gitignore omitted. Dependencies are pinned by the committed
+           Cargo.lock (built with --locked).
+
+To upgrade: fetch a newer tag tarball, verify its sha256, replace these
+files wholesale, update this file, and re-run tools/fs-portal/test.sh
+(the build gate runs upstream's cargo tests via the dumbpipe-test stage).
