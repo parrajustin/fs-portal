@@ -3,6 +3,7 @@ use std::{
     io,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -16,6 +17,7 @@ use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     select,
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -177,6 +179,13 @@ pub struct ListenTcpArgs {
     #[clap(long)]
     pub host: String,
 
+    /// Maximum number of connections to forward concurrently.
+    ///
+    /// Additional incoming connections are queued until a slot frees up.
+    /// 0 means unlimited.
+    #[clap(long, default_value_t = 0)]
+    pub max_connections: usize,
+
     #[clap(flatten)]
     pub common: CommonArgs,
 }
@@ -188,6 +197,13 @@ pub struct ConnectTcpArgs {
     /// To listen on all network interfaces, use 0.0.0.0:12345
     #[clap(long)]
     pub addr: String,
+
+    /// Maximum number of connections to forward concurrently.
+    ///
+    /// Additional incoming connections are queued until a slot frees up.
+    /// 0 means unlimited.
+    #[clap(long, default_value_t = 0)]
+    pub max_connections: usize,
 
     /// The endpoint to connect to
     pub ticket: EndpointTicket,
@@ -322,6 +338,32 @@ fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
     move |x| {
         token.cancel();
         x
+    }
+}
+
+/// Concurrency limiter for the tcp forwarding modes: `Some` semaphore with
+/// `max` permits, or `None` when `max` is 0 (unlimited).
+fn connection_limiter(max: usize) -> Option<Arc<Semaphore>> {
+    (max > 0).then(|| Arc::new(Semaphore::new(max)))
+}
+
+/// Wait for a free forwarding slot. Returns a permit to hold for the lifetime
+/// of the connection, or `None` when no limit is configured. Errors only if
+/// the semaphore is closed, which never happens here.
+async fn acquire_slot(limiter: &Option<Arc<Semaphore>>) -> Result<Option<OwnedSemaphorePermit>> {
+    match limiter {
+        Some(semaphore) => {
+            if semaphore.available_permits() == 0 {
+                tracing::info!("max connections reached, queueing until a slot frees up");
+            }
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .std_context("connection limiter closed")?;
+            Ok(Some(permit))
+        }
+        None => Ok(None),
     }
 }
 
@@ -486,10 +528,15 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         endpoint: Endpoint,
         handshake: bool,
         alpn: &[u8],
+        limiter: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         let (tcp_stream, tcp_addr) = next.std_context("error accepting tcp connection")?;
         let (tcp_recv, tcp_send) = tcp_stream.into_split();
         tracing::info!("got tcp connection from {}", tcp_addr);
+        // hold a forwarding slot for the lifetime of this connection; the tcp
+        // connection is already accepted, so its data just queues until we
+        // dial the peer
+        let _slot = acquire_slot(&limiter).await?;
         let remote_endpoint_id = addr.id;
         let connection = endpoint
             .connect(addr, alpn)
@@ -513,6 +560,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         Ok::<_, AnyError>(())
     }
     let addr = args.ticket.endpoint_addr();
+    let limiter = connection_limiter(args.max_connections);
     loop {
         // also wait for ctrl-c here so we can use it before accepting a connection
         let next = tokio::select! {
@@ -526,8 +574,11 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         let addr = addr.clone();
         let handshake = !args.common.is_custom_alpn();
         let alpn = args.common.alpn()?;
+        let limiter = limiter.clone();
         tokio::spawn(async move {
-            if let Err(cause) = handle_tcp_accept(next, addr, endpoint, handshake, &alpn).await {
+            if let Err(cause) =
+                handle_tcp_accept(next, addr, endpoint, handshake, &alpn, limiter).await
+            {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
@@ -578,6 +629,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
         accepting: Accepting,
         addrs: Vec<std::net::SocketAddr>,
         handshake: bool,
+        limiter: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         let connection = accepting.await.std_context("error accepting connection")?;
         let remote_endpoint_id = &connection.remote_id();
@@ -593,6 +645,10 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
             r.read_exact(&mut buf).await.anyerr()?;
             ensure_any!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
         }
+        // hold a forwarding slot for the lifetime of this connection; the
+        // stream stays open (peer sees a stall, not an error) until a slot
+        // frees up and we dial the local backend
+        let _slot = acquire_slot(&limiter).await?;
         let connection = tokio::net::TcpStream::connect(addrs.as_slice())
             .await
             .std_context(format!("error connecting to {addrs:?}"))?;
@@ -601,6 +657,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
         Ok(())
     }
 
+    let limiter = connection_limiter(args.max_connections);
     loop {
         let incoming = select! {
             incoming = endpoint.accept() => incoming,
@@ -617,8 +674,10 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
         };
         let addrs = addrs.clone();
         let handshake = !args.common.is_custom_alpn();
+        let limiter = limiter.clone();
         tokio::spawn(async move {
-            if let Err(cause) = handle_endpoint_accept(connecting, addrs, handshake).await {
+            if let Err(cause) = handle_endpoint_accept(connecting, addrs, handshake, limiter).await
+            {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal

@@ -84,6 +84,17 @@ t "mixed alias and role" "export import" "$(fsp_roles "transmitter,import")"
 t "aliases are case-insensitive" "export import" "$(fsp_roles "Both")"
 t "receiver+transmitter normalizes" "export import" "$(fsp_roles "receiver,transmitter")"
 
+echo "== fsp_max_streams =="
+t "empty defaults to 5" "5" "$(fsp_max_streams "")"
+t "unset-style whitespace defaults to 5" "5" "$(fsp_max_streams "  ")"
+t "explicit value passes through" "12" "$(fsp_max_streams "12")"
+t "zero disables the cap" "0" "$(fsp_max_streams "0")"
+t "leading zeros normalized" "7" "$(fsp_max_streams "007")"
+t "surrounding whitespace tolerated" "3" "$(fsp_max_streams " 3 ")"
+fsp_max_streams "five" >/dev/null 2>&1; t "words rejected (rc)" 1 $?
+fsp_max_streams "-1" >/dev/null 2>&1; t "negative rejected (rc)" 1 $?
+fsp_max_streams "3.5" >/dev/null 2>&1; t "fraction rejected (rc)" 1 $?
+
 echo "== fsp_serve_args =="
 # Contract: newline-separated argv for `rclone`, serving EXPORT_DIR read-only
 # on 127.0.0.1:$FSP_WEBDAV_PORT only.
