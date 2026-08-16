@@ -15,7 +15,9 @@ services:
     container_name: fs-portal
     restart: always
     environment:
-      - ROLES=export,import
+      # transmitter = only share your library, receiver = only mount theirs,
+      # both = the usual two-way setup
+      - ROLES=both
       - IROH_SECRET=${FS_PORTAL_SECRET}
       - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-}
     volumes:

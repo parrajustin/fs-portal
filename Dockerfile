@@ -27,7 +27,7 @@ COPY --from=dumbpipe /usr/local/bin/dumbpipe /usr/local/bin/dumbpipe
 COPY scripts/lib.sh scripts/entrypoint.sh scripts/healthcheck.sh /opt/fs-portal/
 RUN chmod +x /opt/fs-portal/entrypoint.sh /opt/fs-portal/healthcheck.sh
 
-ENV ROLES="export,import" \
+ENV ROLES="both" \
     EXPORT_DIR=/export \
     MOUNT_DIR=/portal/media \
     CONFIG_DIR=/config \

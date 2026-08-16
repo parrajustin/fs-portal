@@ -76,6 +76,13 @@ t "both, reversed input normalizes" "export import" "$(fsp_roles "import,export"
 t "whitespace tolerated" "export import" "$(fsp_roles " export , import ")"
 fsp_roles "bogus" >/dev/null 2>&1; t "invalid role rejected (rc)" 1 $?
 fsp_roles "export,bogus" >/dev/null 2>&1; t "mixed invalid rejected (rc)" 1 $?
+# friendly aliases: transmitter=export, receiver=import, both=export+import
+t "transmitter alias" "export" "$(fsp_roles "transmitter")"
+t "receiver alias" "import" "$(fsp_roles "receiver")"
+t "both alias" "export import" "$(fsp_roles "both")"
+t "mixed alias and role" "export import" "$(fsp_roles "transmitter,import")"
+t "aliases are case-insensitive" "export import" "$(fsp_roles "Both")"
+t "receiver+transmitter normalizes" "export import" "$(fsp_roles "receiver,transmitter")"
 
 echo "== fsp_serve_args =="
 # Contract: newline-separated argv for `rclone`, serving EXPORT_DIR read-only

@@ -96,7 +96,7 @@ Both computers do the same thing; only the compose file differs
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `ROLES` | `export,import` | run either or both sides |
+| `ROLES` | `both` | `transmitter` (share your library only), `receiver` (mount theirs only), or `both`; `export`/`import` accepted as synonyms, comma-combinable |
 | `IROH_SECRET` | generated → `/config/iroh_secret` | 64-hex stable identity (`openssl rand -hex 32`) |
 | `PEER_TICKET` | — | other side's ticket; or file `/config/peer_ticket` (live pickup) |
 | `EXPORT_DIR` | `/export` | what you share (bind it `:ro`) |

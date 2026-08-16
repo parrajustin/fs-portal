@@ -20,8 +20,10 @@ fsp_gen_secret() {
   od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
 }
 
-# Normalize/validate the ROLES env ("export", "import", "export,import").
-# Echoes the enabled roles space-separated in canonical order; rc=1 on junk.
+# Normalize/validate the ROLES env. Canonical roles are "export" and
+# "import"; "transmitter"/"receiver"/"both" are accepted aliases. Empty
+# defaults to both. Echoes enabled roles space-separated in canonical order;
+# rc=1 on junk.
 fsp_roles() {
   local raw="${1-}" tok want_export=0 want_import=0
   if [[ -z "${raw//[[:space:]]/}" ]]; then
@@ -29,11 +31,15 @@ fsp_roles() {
     return 0
   fi
   for tok in ${raw//,/ }; do
-    case "$tok" in
-      export) want_export=1 ;;
-      import) want_import=1 ;;
+    case "${tok,,}" in
+      export | transmitter) want_export=1 ;;
+      import | receiver) want_import=1 ;;
+      both)
+        want_export=1
+        want_import=1
+        ;;
       *)
-        echo "fs-portal: unknown role '$tok' (valid: export, import)" >&2
+        echo "fs-portal: unknown role '$tok' (valid: transmitter/export, receiver/import, both)" >&2
         return 1
         ;;
     esac
