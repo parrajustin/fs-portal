@@ -98,10 +98,26 @@ want_seek="$(dd if="$WORK/media/Movies/Big Movie (2020)/big.movie.2020.mkv" bs=6
 got_seek="$(docker exec "$IMP" sh -c "dd if='/portal/media/Movies/Big Movie (2020)/big.movie.2020.mkv' bs=64K skip=80 count=1 2>/dev/null | sha256sum" | awk '{print $1}')"
 t "mid-file seek read" "$want_seek" "$got_seek"
 
-echo "== read-only enforcement =="
+echo "== read-only enforcement: layer 1, receiver FUSE mount =="
 docker exec "$IMP" sh -c 'touch /portal/media/should-fail 2>/dev/null'; t "write rejected (rc)" 1 $?
 docker exec "$IMP" sh -c 'rm "/portal/media/note.txt" 2>/dev/null'; t "delete rejected (rc)" 1 $?
 t "note.txt still on exporter" "yes" "$([[ -f "$WORK/media/note.txt" ]] && echo yes)"
+
+echo "== read-only enforcement: layer 2, sender webdav (mount bypassed) =="
+# a hostile/modified receiver talks straight to the tunneled WebDAV port; the
+# exporter's own `rclone serve --read-only` must reject writes on its own.
+docker exec "$IMP" sh -c 'echo evil > /tmp/evil.txt && rclone --webdav-url=http://127.0.0.1:8081 --webdav-vendor=other copyto /tmp/evil.txt :webdav:evil.txt 2>/dev/null'
+t "raw webdav PUT rejected (rc)" 1 $?
+t "PUT left no file on exporter" "yes" "$([[ ! -e "$WORK/media/evil.txt" ]] && echo yes)"
+docker exec "$IMP" sh -c 'rclone --webdav-url=http://127.0.0.1:8081 --webdav-vendor=other deletefile :webdav:note.txt 2>/dev/null'
+t "raw webdav DELETE rejected (rc)" 1 $?
+t "note.txt survives raw DELETE" "yes" "$([[ -f "$WORK/media/note.txt" ]] && echo yes)"
+
+echo "== read-only enforcement: layer 3, sender :ro bind =="
+# even a compromised fs-portal container cannot write the media: docker
+# mounted it read-only at the kernel level.
+docker exec "$EXP" sh -c 'touch /export/evil-from-exporter 2>/dev/null'; t "exporter container write rejected (rc)" 1 $?
+t "no file appeared in sender media" "yes" "$([[ ! -e "$WORK/media/evil-from-exporter" ]] && echo yes)"
 
 echo "== healthchecks =="
 docker exec "$EXP" /opt/fs-portal/healthcheck.sh; t "exporter healthcheck" 0 $?
