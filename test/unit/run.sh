@@ -95,6 +95,44 @@ fsp_max_streams "five" >/dev/null 2>&1; t "words rejected (rc)" 1 $?
 fsp_max_streams "-1" >/dev/null 2>&1; t "negative rejected (rc)" 1 $?
 fsp_max_streams "3.5" >/dev/null 2>&1; t "fraction rejected (rc)" 1 $?
 
+echo "== fsp_procs =="
+t "empty defaults to 1" "1" "$(fsp_procs "")"
+t "whitespace defaults to 1" "1" "$(fsp_procs "  ")"
+t "explicit value passes through" "4" "$(fsp_procs "4")"
+t "leading zeros normalized" "8" "$(fsp_procs "008")"
+t "surrounding whitespace tolerated" "3" "$(fsp_procs " 3 ")"
+t "upper bound accepted" "64" "$(fsp_procs "64")"
+fsp_procs "0" >/dev/null 2>&1; t "zero rejected (rc)" 1 $?
+fsp_procs "65" >/dev/null 2>&1; t "above 64 rejected (rc)" 1 $?
+fsp_procs "-2" >/dev/null 2>&1; t "negative rejected (rc)" 1 $?
+fsp_procs "two" >/dev/null 2>&1; t "words rejected (rc)" 1 $?
+fsp_procs "2.5" >/dev/null 2>&1; t "fraction rejected (rc)" 1 $?
+
+echo "== fsp_import_conf =="
+# Contract: one webdav remote per tunnel process on consecutive ports from
+# FSP_IMPORT_PORT, unioned as "portal:" with search_policy=rand so each file
+# open picks a random tunnel (that is the load distribution).
+conf="$(FSP_IMPORT_PORT=8081 fsp_import_conf 2)"
+t "import conf for 2 procs" \
+"[dp1]
+type = webdav
+url = http://127.0.0.1:8081
+vendor = other
+
+[dp2]
+type = webdav
+url = http://127.0.0.1:8082
+vendor = other
+
+[portal]
+type = union
+upstreams = dp1: dp2:
+search_policy = rand" \
+"$conf"
+conf="$(FSP_IMPORT_PORT=9000 fsp_import_conf 3)"
+t "import conf honors port base" "yes" "$(printf '%s\n' "$conf" | grep -qx 'url = http://127.0.0.1:9002' && echo yes)"
+t "import conf unions all procs" "yes" "$(printf '%s\n' "$conf" | grep -qx 'upstreams = dp1: dp2: dp3:' && echo yes)"
+
 echo "== fsp_bwlimit =="
 t "empty defaults to off" "off" "$(fsp_bwlimit "")"
 t "whitespace defaults to off" "off" "$(fsp_bwlimit "  ")"
@@ -153,6 +191,24 @@ t "mount argv points at import port" "yes" "$(printf '%s\n' "$args" | grep -qx -
 t "mount argv omits bwlimit by default" "" "$(printf '%s\n' "$args" | grep -- '--bwlimit')"
 args="$(FSP_IMPORT_PORT=8081 FSP_CACHE_DIR=/cache FSP_BWLIMIT=10M fsp_mount_args /portal/media)"
 t "mount argv gains bwlimit when set" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--bwlimit=10M' && echo yes)"
+
+echo "== fsp_mount_args multi-process (FSP_PROCS > 1) =="
+# Contract: instead of the single :webdav: remote, mount the "portal:" union
+# remote (config from fsp_import_conf) so reads spread across the tunnels.
+# Everything else (read-only, allow-other, vfs cache, metrics) is unchanged.
+args="$(FSP_PROCS=3 FSP_IMPORT_CONF=/tmp/fsp.conf fsp_mount_args /portal/media)"
+t "multi mount argv mounts union remote" "yes" \
+  "$(printf '%s\n' "$args" | head -2 | tr '\n' ' ' | grep -q '^mount portal: ' && echo yes)"
+t "multi mount argv carries the generated config" "yes" \
+  "$(printf '%s\n' "$args" | grep -qx -- '--config=/tmp/fsp.conf' && echo yes)"
+t "multi mount argv drops webdav-url" "" "$(printf '%s\n' "$args" | grep -- '--webdav-url')"
+t "multi mount argv still read-only" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--read-only' && echo yes)"
+t "multi mount argv still allow-other" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--allow-other' && echo yes)"
+t "multi mount argv still vfs cache" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--vfs-cache-mode=full' && echo yes)"
+args_single="$(fsp_mount_args /portal/media)"
+args_one="$(FSP_PROCS=1 fsp_mount_args /portal/media)"
+t "FSP_PROCS=1 is identical to default" "$args_single" "$args_one"
+FSP_PROCS=nope fsp_mount_args /portal/media >/dev/null 2>&1; t "invalid FSP_PROCS rejected (rc)" 1 $?
 
 echo "== fsp_mount_args observability =="
 # Metrics endpoint on 9102 (togglable), INFO logs, and periodic one-line

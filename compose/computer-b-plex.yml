@@ -20,6 +20,7 @@ services:
       - IROH_SECRET=${FS_PORTAL_SECRET}
       - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-}
       - FSP_MAX_STREAMS=5 # max files streamed at once (0 = unlimited)
+      # - FSP_PROCS=4 # parallel tunnels to spread streaming load (default 1)
     volumes:
       # everything under /export is what your friend will see (read-only)
       - /mnt/user/video/:/export:ro

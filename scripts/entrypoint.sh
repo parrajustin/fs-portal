@@ -32,6 +32,11 @@ if [[ "$FSP_BWLIMIT" != off ]]; then
 else
   log "bandwidth limit: none (set FSP_BWLIMIT, e.g. 10M, to cap transfer rate)"
 fi
+FSP_PROCS="$(fsp_procs "${FSP_PROCS:-}")" || die "invalid FSP_PROCS='${FSP_PROCS:-}'"
+FSP_IMPORT_CONF="${FSP_IMPORT_CONF:-/tmp/fsp-import-rclone.conf}"
+if [[ "$FSP_PROCS" -gt 1 ]]; then
+  log "import tunnel processes: $FSP_PROCS (FSP_PROCS; file streams are distributed across them)"
+fi
 mkdir -p "$CONFIG_DIR"
 
 # ---- observability --------------------------------------------------------
@@ -43,11 +48,12 @@ export RUST_LOG="${RUST_LOG:-dumbpipe=info}"
 #   9101 rclone serve   9102 rclone mount
 #   9103 dumbpipe listen (transmitter)   9104 dumbpipe connect (receiver)
 DP_LISTEN_METRICS=()
-DP_CONNECT_METRICS=()
+CONNECT_METRICS_BASE="${FSP_CONNECT_METRICS_PORT:-9104}"
 if [[ "${FSP_METRICS:-1}" != 0 ]]; then
   DP_LISTEN_METRICS=(env "DUMBPIPE_METRICS_ADDR=0.0.0.0:${FSP_LISTEN_METRICS_PORT:-9103}")
-  DP_CONNECT_METRICS=(env "DUMBPIPE_METRICS_ADDR=0.0.0.0:${FSP_CONNECT_METRICS_PORT:-9104}")
-  log "metrics: rclone :${FSP_SERVE_METRICS_PORT:-9101}(serve)/:${FSP_MOUNT_METRICS_PORT:-9102}(mount), dumbpipe :${FSP_LISTEN_METRICS_PORT:-9103}(listen)/:${FSP_CONNECT_METRICS_PORT:-9104}(connect) — publish the ports to scrape (FSP_METRICS=0 disables)"
+  connect_ports=":$CONNECT_METRICS_BASE"
+  [[ "$FSP_PROCS" -gt 1 ]] && connect_ports=":$CONNECT_METRICS_BASE-:$((CONNECT_METRICS_BASE + FSP_PROCS - 1))"
+  log "metrics: rclone :${FSP_SERVE_METRICS_PORT:-9101}(serve)/:${FSP_MOUNT_METRICS_PORT:-9102}(mount), dumbpipe :${FSP_LISTEN_METRICS_PORT:-9103}(listen)/${connect_ports}(connect) — publish the ports to scrape (FSP_METRICS=0 disables)"
 else
   log "metrics: disabled (FSP_METRICS=0)"
 fi
@@ -169,10 +175,25 @@ if [[ " $ROLES_ACTIVE " == *" import "* ]]; then
   # clear any stale mount from an unclean shutdown
   fusermount3 -uz "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
 
-  log "import: bridging peer's webdav to 127.0.0.1:$FSP_IMPORT_PORT over iroh"
-  supervise dumbpipe-connect "${DP_CONNECT_METRICS[@]}" dumbpipe connect-tcp --addr "127.0.0.1:$FSP_IMPORT_PORT" --max-connections "$FSP_MAX_STREAMS" "$PEER_TICKET"
-  wait_for_port "$FSP_IMPORT_PORT" 30 || die "dumbpipe connect-tcp did not open local port"
+  log "import: bridging peer's webdav to 127.0.0.1:$FSP_IMPORT_PORT over iroh ($FSP_PROCS tunnel process(es))"
+  for ((i = 1; i <= FSP_PROCS; i++)); do
+    port=$((FSP_IMPORT_PORT + i - 1))
+    name=dumbpipe-connect
+    [[ "$FSP_PROCS" -gt 1 ]] && name="dumbpipe-connect-$i"
+    connect_metrics=()
+    if [[ "${FSP_METRICS:-1}" != 0 ]]; then
+      connect_metrics=(env "DUMBPIPE_METRICS_ADDR=0.0.0.0:$((CONNECT_METRICS_BASE + i - 1))")
+    fi
+    supervise "$name" "${connect_metrics[@]}" dumbpipe connect-tcp --addr "127.0.0.1:$port" --max-connections "$FSP_MAX_STREAMS" "$PEER_TICKET"
+  done
+  for ((i = 1; i <= FSP_PROCS; i++)); do
+    wait_for_port $((FSP_IMPORT_PORT + i - 1)) 30 || die "dumbpipe connect-tcp did not open local port $((FSP_IMPORT_PORT + i - 1))"
+  done
 
+  if [[ "$FSP_PROCS" -gt 1 ]]; then
+    fsp_import_conf "$FSP_PROCS" > "$FSP_IMPORT_CONF"
+    log "import: distributing file streams across $FSP_PROCS tunnels (rclone union, random tunnel per file open; $FSP_IMPORT_CONF)"
+  fi
   mapfile -t mount_argv < <(fsp_mount_args "$MOUNT_DIR")
   log "import: mounting peer library at $MOUNT_DIR (read-only)"
   (

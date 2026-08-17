@@ -70,10 +70,14 @@ t "ticket produced" "yes" "yes"
 echo "  ticket: ${TICKET:0:32}..."
 
 echo "== start importer =="
+# FSP_PROCS=2: two dumbpipe connect-tcp tunnel processes (ports 8081+8082),
+# rclone mounting the union of both — all the content checks below then run
+# through the multi-process path.
 docker run -d --name "$IMP" --network "$NET" --no-healthcheck \
   -e ROLES=import \
   -e PEER_TICKET="$TICKET" \
   -e FSP_MAX_STREAMS=3 \
+  -e FSP_PROCS=2 \
   --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
   "$IMAGE" >/dev/null || { echo "FATAL: importer failed to start"; exit 1; }
 
@@ -151,6 +155,14 @@ t "sampler saw traffic (max >= 1)" "yes" "$([[ "$max_conns" -ge 1 ]] && echo yes
 t "never more than 2 concurrent streams reach the exporter" "yes" \
   "$([[ "$max_conns" -le 2 ]] && echo yes)"
 
+echo "== multi-process import: FSP_PROCS=2 =="
+# exec pgrep directly (no sh -c wrapper: its cmdline would match the pattern)
+n_tunnels="$(docker exec "$IMP" pgrep -f 'dumbpipe connect-tcp' | wc -l)"
+t "two tunnel processes running" "2" "$(echo "$n_tunnels" | tr -d '[:space:]')"
+port2=no
+docker exec "$IMP" bash -c '(exec 3<>/dev/tcp/127.0.0.1/8082) 2>/dev/null' && port2=yes
+t "second tunnel port open (8082)" "yes" "$port2"
+
 echo "== read-only enforcement: layer 1, receiver FUSE mount =="
 docker exec "$IMP" sh -c 'touch /portal/media/should-fail 2>/dev/null'; t "write rejected (rc)" 1 $?
 docker exec "$IMP" sh -c 'rm "/portal/media/note.txt" 2>/dev/null'; t "delete rejected (rc)" 1 $?
@@ -209,6 +221,9 @@ m="$(scrape "$EXP" 9103 '^dumbpipe_connections_total')"
 t "dumbpipe listen metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
 m="$(scrape "$IMP" 9104 '^dumbpipe_connections_total')"
 t "dumbpipe connect metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
+# with FSP_PROCS=2 the second tunnel process gets the next port
+m2="$(scrape "$IMP" 9105 '^dumbpipe_connections_total')"
+t "second tunnel metrics respond (9105)" "yes" "$([[ -n "$m2" ]] && echo yes)"
 # the importer's dumbpipe survived the whole run: it must have counted the
 # earlier transfers (8MB movie + parallel caps) as bytes from the peer
 bytes_from_peer="$(echo "$m" | awk '/^dumbpipe_bytes_from_peer_total /{print $2}')"

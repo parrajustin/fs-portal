@@ -68,6 +68,25 @@ fsp_max_streams() {
   echo $((10#$raw))
 }
 
+# Normalize/validate FSP_PROCS: how many parallel dumbpipe connect-tcp
+# processes (each a separate iroh QUIC connection) the import side runs, on
+# consecutive local ports starting at FSP_IMPORT_PORT. File streams are
+# distributed across them (see fsp_import_conf). Empty defaults to 1.
+# Echoes the normalized number; rc=1 on junk (must be an integer 1..64).
+fsp_procs() {
+  local raw="${1-}"
+  raw="${raw//[[:space:]]/}"
+  if [[ -z "$raw" ]]; then
+    echo 1
+    return 0
+  fi
+  if [[ ! "$raw" =~ ^[0-9]+$ ]] || ((10#$raw < 1 || 10#$raw > 64)); then
+    echo "fs-portal: FSP_PROCS must be an integer between 1 and 64, got '$1'" >&2
+    return 1
+  fi
+  echo $((10#$raw))
+}
+
 # Normalize/validate FSP_BWLIMIT: an rclone --bwlimit spec applied to rclone
 # on both sides (the transmitter's webdav serve and the receiver's FUSE
 # mount) so a bulk read can't saturate the link — and with it the CPU, since
@@ -120,18 +139,46 @@ fsp_serve_args() {
   fi
 }
 
+# rclone config (ini) for a multi-process import (FSP_PROCS > 1): one
+# localhost webdav remote per dumbpipe connect-tcp process (dp1..dpN on
+# consecutive ports starting at FSP_IMPORT_PORT), unioned as "portal:" with
+# search_policy=rand so every file open lands on a random tunnel process —
+# that is what distributes the streaming load across the processes.
+fsp_import_conf() { # fsp_import_conf <nprocs>
+  local n="$1" base="${FSP_IMPORT_PORT:-8081}" i upstreams=""
+  for ((i = 1; i <= n; i++)); do
+    printf '[dp%d]\ntype = webdav\nurl = http://127.0.0.1:%d\nvendor = other\n\n' \
+      "$i" $((base + i - 1))
+    upstreams+="dp$i: "
+  done
+  printf '[portal]\ntype = union\nupstreams = %s\nsearch_policy = rand\n' "${upstreams% }"
+}
+
 # rclone argv (newline-separated) FUSE-mounting the peer's WebDAV (as exposed
 # locally by `dumbpipe connect-tcp`) at $1. Read-only + allow-other so any
 # sibling-container uid (plex/jellyfin PUID) can read through the propagated
 # mount; full VFS cache is the recommended mode for media servers.
+# With FSP_PROCS > 1 the single webdav remote is replaced by the union remote
+# from fsp_import_conf (written to $FSP_IMPORT_CONF by the entrypoint) so
+# reads spread across the connect-tcp processes.
 fsp_mount_args() {
-  local target="$1"
+  local target="$1" procs
+  procs="$(fsp_procs "${FSP_PROCS:-}")" || return 1
+  if ((procs > 1)); then
+    printf '%s\n' \
+      mount \
+      "portal:" \
+      "$target" \
+      "--config=${FSP_IMPORT_CONF:-/tmp/fsp-import-rclone.conf}"
+  else
+    printf '%s\n' \
+      mount \
+      ":webdav:" \
+      "$target" \
+      "--webdav-url=http://127.0.0.1:${FSP_IMPORT_PORT:-8081}" \
+      --webdav-vendor=other
+  fi
   printf '%s\n' \
-    mount \
-    ":webdav:" \
-    "$target" \
-    "--webdav-url=http://127.0.0.1:${FSP_IMPORT_PORT:-8081}" \
-    --webdav-vendor=other \
     --read-only \
     --allow-other \
     --umask=022 \

@@ -137,6 +137,7 @@ services:
       - ROLES=receiver
       - PEER_TICKET=${FS_PORTAL_PEER_TICKET} # ticket from the transmitter
       - FSP_MAX_STREAMS=5 # max files streamed at once (0 = unlimited)
+      # - FSP_PROCS=4 # parallel tunnels to spread streaming load (default 1)
     volumes:
       - ${FS_PORTAL_ROOT}/portal:/portal:rshared
       - ${FS_PORTAL_ROOT}/config:/config
@@ -165,6 +166,7 @@ services:
       - IROH_SECRET=${FS_PORTAL_SECRET}
       - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-} # empty on first boot
       - FSP_MAX_STREAMS=5 # max files streamed at once (0 = unlimited)
+      # - FSP_PROCS=4 # parallel tunnels to spread streaming load (default 1)
     volumes:
       - /path/to/your/media:/export:ro
       - ${FS_PORTAL_ROOT}/portal:/portal:rshared
@@ -216,6 +218,18 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
   throttles its own media server (e.g. a library scan opening every file) —
   so one bulk read can't spiral into 100% CPU. Excess opens simply queue
   until a slot frees; nothing errors. Set `0` to disable.
+- **Parallel tunnels** (opt-in): `FSP_PROCS=N` makes the receiver run `N`
+  `dumbpipe connect-tcp` processes instead of one — each a separate iroh QUIC
+  connection with its own congestion window and its own CPU footprint — and
+  distributes file streams across them (each file open lands on a random
+  tunnel, via an rclone union remote). Use it when a single tunnel process
+  becomes the throughput or CPU bottleneck on big parallel reads. Default `1`
+  (single tunnel, identical to previous behavior). Notes: `FSP_MAX_STREAMS`
+  is enforced *per tunnel process* on the receiver (the transmitter still
+  enforces its own global cap), the extra tunnels use consecutive local ports
+  after `8081` in-container, and each extra process exposes metrics on the
+  next port after `9104`. The transmitter side needs no configuration — its
+  single listener accepts all tunnels.
 - **Bounded bandwidth** (opt-in): `FSP_BWLIMIT` caps rclone's transfer rate
   on each side — the transmitter throttles what it serves into the tunnel,
   the receiver throttles its own reads of the peer (both verified against
@@ -253,7 +267,7 @@ default — add `ports:` to scrape from outside; `FSP_METRICS=0` disables all):
 | `9101` | rclone serve (transmitter) | rclone core + HTTP server metrics |
 | `9102` | rclone mount (receiver) | rclone VFS/cache/transfer metrics |
 | `9103` | dumbpipe listen (transmitter) | `dumbpipe_connections_total/active/closed`, `dumbpipe_bytes_{to,from}_peer_total`, `dumbpipe_connection_errors_total`, `dumbpipe_queue_waits_total`, `dumbpipe_stream_duration_ms_total` |
-| `9104` | dumbpipe connect (receiver) | same counters, receiver side |
+| `9104` | dumbpipe connect (receiver) | same counters, receiver side; with `FSP_PROCS` > 1, tunnel *i* serves `9104 + i − 1` |
 
 Scrape example (add to the fs-portal service: `ports: ["9101-9104:9101-9104"]`):
 
@@ -282,7 +296,8 @@ stays pinned.
 | `PEER_TICKET` | — | other side's ticket; or file `/config/peer_ticket` (live pickup) |
 | `EXPORT_DIR` | `/export` | what you share (bind it `:ro`) |
 | `MOUNT_DIR` | `/portal/media` | where the peer's library appears |
-| `FSP_MAX_STREAMS` | `5` | max files streamed concurrently, enforced on both sides (`0` = unlimited) |
+| `FSP_MAX_STREAMS` | `5` | max files streamed concurrently, enforced on both sides (`0` = unlimited); with `FSP_PROCS` > 1 this is per tunnel process |
+| `FSP_PROCS` | `1` | receiver-side parallel tunnel processes (1–64); file streams are distributed across them, each is its own iroh connection |
 | `FSP_BWLIMIT` | `off` | total rclone bandwidth cap per side, e.g. `10M` = 10 MiB/s; accepts `UP:DOWN` pairs and rclone timetables |
 | `FSP_VFS_CACHE_MAX_SIZE` | `2G` | local read cache for streaming |
 | `FSP_DIR_CACHE_TIME` | `30s` | how quickly new remote files appear |

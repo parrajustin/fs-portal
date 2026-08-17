@@ -16,7 +16,9 @@ if [[ " $ROLES_ACTIVE " == *" export "* ]]; then
 fi
 
 if [[ " $ROLES_ACTIVE " == *" import "* ]]; then
-  pgrep -f 'dumbpipe connect-tcp' >/dev/null || exit 1
+  # every tunnel process must be alive (FSP_PROCS of them, default 1)
+  FSP_PROCS="$(fsp_procs "${FSP_PROCS:-}")" || exit 1
+  [[ "$(pgrep -f 'dumbpipe connect-tcp' | wc -l)" -ge "$FSP_PROCS" ]] || exit 1
   # FUSE mount actually present and listable
   grep -qs " $(echo "$MOUNT_DIR" | sed 's/ /\\\\040/g') fuse.rclone" /proc/mounts || exit 1
   ls "$MOUNT_DIR" >/dev/null 2>&1 || exit 1
