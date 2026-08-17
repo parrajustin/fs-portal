@@ -68,6 +68,36 @@ fsp_max_streams() {
   echo $((10#$raw))
 }
 
+# Normalize/validate FSP_BWLIMIT: an rclone --bwlimit spec applied to rclone
+# on both sides (the transmitter's webdav serve and the receiver's FUSE
+# mount) so a bulk read can't saturate the link — and with it the CPU, since
+# iroh's per-chunk encryption cost scales with throughput. Empty defaults to
+# "off" (no limit). Accepts a single rate ("10M" = 10 MiB/s; bare numbers
+# are KiB/s; units are Byte/s, not bit/s), an upload:download pair
+# ("10M:100k", either side "off"), or an rclone timetable (contains a comma
+# — passed through for rclone to validate). Echoes the normalized spec;
+# rc=1 on junk.
+fsp_bwlimit() {
+  local raw="${1-}"
+  # trim surrounding whitespace only — timetable specs have inner spaces
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  if [[ -z "$raw" || "${raw,,}" == off ]]; then
+    echo off
+    return 0
+  fi
+  if [[ "$raw" == *,* ]]; then
+    echo "$raw"
+    return 0
+  fi
+  local rate='(off|[0-9]+(\.[0-9]+)?([bkmgtp]i?b?)?)'
+  if [[ ! "${raw,,}" =~ ^${rate}(:${rate})?$ ]]; then
+    echo "fs-portal: FSP_BWLIMIT must be an rclone bandwidth spec — a rate like '10M' (Byte/s units), an 'upload:download' pair like '10M:1M', 'off', or an rclone timetable — got '$1'" >&2
+    return 1
+  fi
+  echo "$raw"
+}
+
 # rclone argv (newline-separated) serving EXPORT_DIR read-only over WebDAV,
 # bound to localhost only — dumbpipe is the sole way in from outside.
 # Observability: INFO request logging always; Prometheus metrics on
@@ -84,6 +114,9 @@ fsp_serve_args() {
     "--log-level=${FSP_RCLONE_LOG_LEVEL:-INFO}"
   if [[ "${FSP_METRICS:-1}" != 0 ]]; then
     printf '%s\n' "--metrics-addr=0.0.0.0:${FSP_SERVE_METRICS_PORT:-9101}"
+  fi
+  if [[ "${FSP_BWLIMIT:-off}" != off ]]; then
+    printf '%s\n' "--bwlimit=$FSP_BWLIMIT"
   fi
 }
 
@@ -116,5 +149,8 @@ fsp_mount_args() {
     --stats-one-line
   if [[ "${FSP_METRICS:-1}" != 0 ]]; then
     printf '%s\n' "--metrics-addr=0.0.0.0:${FSP_MOUNT_METRICS_PORT:-9102}"
+  fi
+  if [[ "${FSP_BWLIMIT:-off}" != off ]]; then
+    printf '%s\n' "--bwlimit=$FSP_BWLIMIT"
   fi
 }

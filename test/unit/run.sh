@@ -95,6 +95,24 @@ fsp_max_streams "five" >/dev/null 2>&1; t "words rejected (rc)" 1 $?
 fsp_max_streams "-1" >/dev/null 2>&1; t "negative rejected (rc)" 1 $?
 fsp_max_streams "3.5" >/dev/null 2>&1; t "fraction rejected (rc)" 1 $?
 
+echo "== fsp_bwlimit =="
+t "empty defaults to off" "off" "$(fsp_bwlimit "")"
+t "whitespace defaults to off" "off" "$(fsp_bwlimit "  ")"
+t "off normalizes case" "off" "$(fsp_bwlimit "OFF")"
+t "single rate passes through" "10M" "$(fsp_bwlimit "10M")"
+t "surrounding whitespace trimmed" "10M" "$(fsp_bwlimit " 10M ")"
+t "lowercase suffix ok" "512k" "$(fsp_bwlimit "512k")"
+t "bare number ok (KiB/s)" "100" "$(fsp_bwlimit "100")"
+t "fractional rate ok" "1.5M" "$(fsp_bwlimit "1.5M")"
+t "full unit suffix ok" "10MiB" "$(fsp_bwlimit "10MiB")"
+t "upload:download pair ok" "10M:100k" "$(fsp_bwlimit "10M:100k")"
+t "pair with off side ok" "10M:off" "$(fsp_bwlimit "10M:off")"
+t "timetable passed through" "08:00,512k 12:00,10M" "$(fsp_bwlimit "08:00,512k 12:00,10M")"
+fsp_bwlimit "fast" >/dev/null 2>&1; t "words rejected (rc)" 1 $?
+fsp_bwlimit "10Q" >/dev/null 2>&1; t "bogus suffix rejected (rc)" 1 $?
+fsp_bwlimit "10M:" >/dev/null 2>&1; t "dangling pair rejected (rc)" 1 $?
+fsp_bwlimit "10 M" >/dev/null 2>&1; t "inner space rejected (rc)" 1 $?
+
 echo "== fsp_serve_args =="
 # Contract: newline-separated argv for `rclone`, serving EXPORT_DIR read-only
 # on 127.0.0.1:$FSP_WEBDAV_PORT only. FSP_METRICS=0 disables the metrics
@@ -116,6 +134,10 @@ args="$(EXPORT_DIR=/export FSP_SERVE_METRICS_PORT=19101 fsp_serve_args)"
 t "serve metrics port override" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--metrics-addr=0.0.0.0:19101' && echo yes)"
 args="$(EXPORT_DIR=/export FSP_RCLONE_LOG_LEVEL=DEBUG fsp_serve_args)"
 t "serve log level override" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--log-level=DEBUG' && echo yes)"
+args="$(EXPORT_DIR=/export FSP_WEBDAV_PORT=8080 FSP_BWLIMIT=10M fsp_serve_args)"
+t "serve argv gains bwlimit when set" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--bwlimit=10M' && echo yes)"
+args="$(EXPORT_DIR=/export FSP_WEBDAV_PORT=8080 FSP_BWLIMIT=off fsp_serve_args)"
+t "serve argv omits bwlimit when off" "" "$(printf '%s\n' "$args" | grep -- '--bwlimit')"
 
 echo "== fsp_mount_args =="
 # Contract: mounts the webdav remote (proxied peer) at $1, read-only,
@@ -128,6 +150,9 @@ t "mount argv allow-other" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--allow
 t "mount argv vfs cache" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--vfs-cache-mode=full' && echo yes)"
 t "mount argv target" "yes" "$(printf '%s\n' "$args" | grep -qx -- '/portal/media' && echo yes)"
 t "mount argv points at import port" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--webdav-url=http://127.0.0.1:8081' && echo yes)"
+t "mount argv omits bwlimit by default" "" "$(printf '%s\n' "$args" | grep -- '--bwlimit')"
+args="$(FSP_IMPORT_PORT=8081 FSP_CACHE_DIR=/cache FSP_BWLIMIT=10M fsp_mount_args /portal/media)"
+t "mount argv gains bwlimit when set" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--bwlimit=10M' && echo yes)"
 
 echo "== fsp_mount_args observability =="
 # Metrics endpoint on 9102 (togglable), INFO logs, and periodic one-line

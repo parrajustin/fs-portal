@@ -216,6 +216,14 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
   throttles its own media server (e.g. a library scan opening every file) —
   so one bulk read can't spiral into 100% CPU. Excess opens simply queue
   until a slot frees; nothing errors. Set `0` to disable.
+- **Bounded bandwidth** (opt-in): `FSP_BWLIMIT` caps rclone's transfer rate
+  on each side — the transmitter throttles what it serves into the tunnel,
+  the receiver throttles its own reads of the peer (both verified against
+  rclone v1.71). `FSP_MAX_STREAMS` bounds *how many* files stream at once;
+  `FSP_BWLIMIT` bounds *how fast* they flow in total, which also bounds the
+  CPU spent on iroh's per-chunk encryption. `10M` = 10 MiB/s (units are
+  Byte/s, not bit/s); `UP:DOWN` pairs (`10M:1M`) and [rclone bwlimit
+  timetables](https://rclone.org/docs/#bwlimit-bandwidth-spec) also work.
 
 ## Observability
 
@@ -275,6 +283,7 @@ stays pinned.
 | `EXPORT_DIR` | `/export` | what you share (bind it `:ro`) |
 | `MOUNT_DIR` | `/portal/media` | where the peer's library appears |
 | `FSP_MAX_STREAMS` | `5` | max files streamed concurrently, enforced on both sides (`0` = unlimited) |
+| `FSP_BWLIMIT` | `off` | total rclone bandwidth cap per side, e.g. `10M` = 10 MiB/s; accepts `UP:DOWN` pairs and rclone timetables |
 | `FSP_VFS_CACHE_MAX_SIZE` | `2G` | local read cache for streaming |
 | `FSP_DIR_CACHE_TIME` | `30s` | how quickly new remote files appear |
 | `FSP_METRICS` | `1` | `0` disables all four Prometheus endpoints |

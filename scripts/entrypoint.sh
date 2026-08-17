@@ -26,6 +26,12 @@ if [[ "$FSP_MAX_STREAMS" -gt 0 ]]; then
 else
   log "max concurrent file streams: unlimited (set FSP_MAX_STREAMS to cap)"
 fi
+FSP_BWLIMIT="$(fsp_bwlimit "${FSP_BWLIMIT:-}")" || die "invalid FSP_BWLIMIT='${FSP_BWLIMIT:-}'"
+if [[ "$FSP_BWLIMIT" != off ]]; then
+  log "bandwidth limit: $FSP_BWLIMIT (FSP_BWLIMIT; Byte/s units, applied to rclone serve and mount)"
+else
+  log "bandwidth limit: none (set FSP_BWLIMIT, e.g. 10M, to cap transfer rate)"
+fi
 mkdir -p "$CONFIG_DIR"
 
 # ---- observability --------------------------------------------------------
