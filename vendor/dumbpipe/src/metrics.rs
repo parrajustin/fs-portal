@@ -12,7 +12,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -114,6 +114,7 @@ pub fn render_labeled(instance: Option<&str>) -> String {
         "Sum of completed stream durations in milliseconds",
         get(&STREAM_DURATION_MS_TOTAL),
     );
+    render_file_metrics(&mut out, instance);
     out
 }
 
@@ -154,6 +155,163 @@ pub fn spawn_server_from_env() {
             }
         })
         .ok();
+}
+
+// ---- per-file metrics ------------------------------------------------------
+//
+// The forwarder sniffs WebDAV request lines out of the tunneled HTTP traffic
+// (see FileTracker in main.rs) and attributes payload bytes to the file being
+// read. Cardinality is bounded: at most DUMBPIPE_FILE_METRICS_MAX (default
+// 128, 0 disables) file series are kept; the least recently touched inactive
+// entry is evicted first.
+
+/// Per-file counters, keyed by the decoded request path.
+struct FileEntry {
+    bytes: u64,
+    requests: u64,
+    seconds_ms: u64,
+    active: u64,
+    last_seen: Instant,
+}
+
+impl Default for FileEntry {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            requests: 0,
+            seconds_ms: 0,
+            active: 0,
+            last_seen: Instant::now(),
+        }
+    }
+}
+
+static FILES: LazyLock<Mutex<BTreeMap<String, FileEntry>>> = LazyLock::new(Default::default);
+
+fn file_metrics_max() -> usize {
+    static MAX: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("DUMBPIPE_FILE_METRICS_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128)
+    });
+    *MAX
+}
+
+/// Evict entries until at most `max` remain: least recently touched first,
+/// never preferring an entry with an active read over an inactive one.
+fn evict_to(files: &mut BTreeMap<String, FileEntry>, max: usize) {
+    while files.len() > max {
+        let victim = files
+            .iter()
+            .min_by_key(|(_, e)| (e.active > 0, e.last_seen))
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                files.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
+fn with_file_entry(path: &str, f: impl FnOnce(&mut FileEntry)) {
+    let max = file_metrics_max();
+    if max == 0 {
+        return;
+    }
+    let mut files = FILES.lock().unwrap();
+    if !files.contains_key(path) {
+        evict_to(&mut files, max.saturating_sub(1));
+        files.insert(path.to_string(), FileEntry::default());
+    }
+    let entry = files.get_mut(path).unwrap();
+    entry.last_seen = Instant::now();
+    f(entry);
+}
+
+/// A GET for this file passed through the tunnel.
+pub fn file_request(path: &str) {
+    with_file_entry(path, |e| e.requests += 1);
+}
+
+/// Payload bytes forwarded for this file.
+pub fn file_bytes(path: &str, n: u64) {
+    with_file_entry(path, |e| e.bytes += n);
+}
+
+/// A read session on this file started (first GET of a path run).
+pub fn file_session_started(path: &str) {
+    with_file_entry(path, |e| e.active += 1);
+}
+
+/// The read session ended (path changed or the stream closed).
+pub fn file_session_closed(path: &str, duration: Duration) {
+    with_file_entry(path, |e| {
+        e.active = e.active.saturating_sub(1);
+        e.seconds_ms += duration.as_millis() as u64;
+    });
+}
+
+/// Escape a string for use as a Prometheus label value (backslash, quote,
+/// newline — file paths may contain anything).
+fn escape_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Append the per-file metric families to a rendered exposition.
+fn render_file_metrics(out: &mut String, instance: Option<&str>) {
+    let files = FILES.lock().unwrap();
+    if files.is_empty() {
+        return;
+    }
+    let proc_suffix = instance
+        .map(|i| format!(",proc=\"{}\"", sanitize_label(i)))
+        .unwrap_or_default();
+    let mut family =
+        |name: &str, kind: &str, help: &str, value: &dyn Fn(&FileEntry) -> String| {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+            for (path, entry) in files.iter() {
+                out.push_str(&format!(
+                    "{name}{{file=\"{}\"{proc_suffix}}} {}\n",
+                    escape_label_value(path),
+                    value(entry)
+                ));
+            }
+        };
+    family(
+        "dumbpipe_file_bytes_sent_total",
+        "counter",
+        "Payload bytes forwarded per served file",
+        &|e| e.bytes.to_string(),
+    );
+    family(
+        "dumbpipe_file_requests_total",
+        "counter",
+        "GET requests forwarded per served file",
+        &|e| e.requests.to_string(),
+    );
+    family(
+        "dumbpipe_file_active_reads",
+        "gauge",
+        "Read sessions currently open per served file",
+        &|e| e.active.to_string(),
+    );
+    family(
+        "dumbpipe_file_read_seconds_total",
+        "counter",
+        "Total seconds spent in read sessions per served file (bytes / seconds = average speed)",
+        &|e| format!("{:.3}", e.seconds_ms as f64 / 1000.0),
+    );
 }
 
 // ---- central metrics server (push aggregation) ----------------------------
@@ -433,6 +591,54 @@ mod tests {
             .expect("sample line");
         let value: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
         assert!(value >= 12345);
+    }
+
+    #[test]
+    fn escape_label_value_handles_specials() {
+        assert_eq!(escape_label_value("/a/plain path (1).mkv"), "/a/plain path (1).mkv");
+        assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+    }
+
+    #[test]
+    fn file_metrics_render_with_and_without_proc_label() {
+        file_request("/m/render-test one.mkv");
+        file_bytes("/m/render-test one.mkv", 42);
+        file_session_started("/m/render-test one.mkv");
+        file_session_closed("/m/render-test one.mkv", Duration::from_millis(1500));
+        let plain = render();
+        assert!(plain.contains("# TYPE dumbpipe_file_bytes_sent_total counter"));
+        assert!(plain.contains("dumbpipe_file_bytes_sent_total{file=\"/m/render-test one.mkv\"} 42"));
+        assert!(plain.contains("dumbpipe_file_active_reads{file=\"/m/render-test one.mkv\"} 0"));
+        assert!(plain.contains("dumbpipe_file_read_seconds_total{file=\"/m/render-test one.mkv\"} 1.500"));
+        let labeled = render_labeled(Some("dp1"));
+        assert!(labeled
+            .contains("dumbpipe_file_bytes_sent_total{file=\"/m/render-test one.mkv\",proc=\"dp1\"} 42"));
+    }
+
+    #[test]
+    fn eviction_keeps_recent_and_active_entries() {
+        let mut files: BTreeMap<String, FileEntry> = BTreeMap::new();
+        let base = Instant::now();
+        for (name, active, age_ms) in
+            [("old-idle", 0, 300), ("old-active", 1, 200), ("fresh", 0, 0)]
+        {
+            files.insert(
+                name.to_string(),
+                FileEntry {
+                    bytes: 1,
+                    requests: 1,
+                    seconds_ms: 0,
+                    active,
+                    last_seen: base - Duration::from_millis(age_ms),
+                },
+            );
+        }
+        evict_to(&mut files, 2);
+        assert!(!files.contains_key("old-idle"), "oldest idle entry evicted first");
+        assert!(files.contains_key("old-active"));
+        assert!(files.contains_key("fresh"));
+        evict_to(&mut files, 1);
+        assert!(files.contains_key("old-active"), "active entries outlive idle ones");
     }
 
     #[test]

@@ -282,10 +282,11 @@ async fn copy_to_noq(
     mut send: noq::SendStream,
     token: CancellationToken,
     conn_id: u64,
+    tracker: Arc<FileTracker>,
 ) -> io::Result<u64> {
     tracing::trace!("copying to noq");
     tokio::select! {
-        res = instrumented_copy(from, &mut send, conn_id, "to_peer", &metrics::BYTES_TO_PEER_TOTAL) => {
+        res = instrumented_copy(from, &mut send, conn_id, "to_peer", &metrics::BYTES_TO_PEER_TOTAL, &tracker) => {
             let size = res?;
             send.finish()?;
             Ok(size)
@@ -309,9 +310,10 @@ async fn copy_from_noq(
     mut to: impl AsyncWrite + Unpin,
     token: CancellationToken,
     conn_id: u64,
+    tracker: Arc<FileTracker>,
 ) -> io::Result<u64> {
     tokio::select! {
-        res = instrumented_copy(&mut recv, &mut to, conn_id, "from_peer", &metrics::BYTES_FROM_PEER_TOTAL) => {
+        res = instrumented_copy(&mut recv, &mut to, conn_id, "from_peer", &metrics::BYTES_FROM_PEER_TOTAL, &tracker) => {
             Ok(res?)
         },
         _ = token.cancelled() => {
@@ -324,6 +326,175 @@ async fn copy_from_noq(
 /// How many forwarded bytes between per-chunk speed log lines.
 const CHUNK_LOG_BYTES: u64 = 32 * 1024 * 1024;
 
+// ---- per-file observability (local addition, fs-portal) --------------------
+//
+// The forwarded bytes are WebDAV HTTP traffic: one direction carries request
+// lines ("GET /Movies/x.mkv HTTP/1.1"), the other the file payload. By
+// sniffing request lines we can attribute payload bytes to the file being
+// served — which file, how many bytes, how fast, and when reading stopped —
+// in both logs and the per-file metric families in metrics.rs.
+
+/// Percent-decode a URL path (best-effort; invalid escapes pass through).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse an HTTP request at the start of a forwarded buffer. Returns
+/// (method, decoded path, Range header value if present in the same buffer).
+/// Payload buffers fail the cheap prefix checks immediately.
+fn parse_http_request(buf: &[u8]) -> Option<(String, String, Option<String>)> {
+    const METHODS: [&str; 12] = [
+        "GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS", "PROPFIND", "MKCOL", "MOVE", "COPY",
+        "LOCK", "UNLOCK",
+    ];
+    // request line fits well within any real first buffer
+    let line_end = buf.iter().take(2048).position(|&b| b == b'\r')?;
+    let line = std::str::from_utf8(&buf[..line_end]).ok()?;
+    let mut parts = line.split(' ');
+    let method = parts.next()?;
+    if !METHODS.contains(&method) {
+        return None;
+    }
+    let path = parts.next()?;
+    if !parts.next()?.starts_with("HTTP/") {
+        return None;
+    }
+    let path = percent_decode(path.split('?').next().unwrap_or(path));
+    // best-effort Range header scan within the same buffer's header block
+    let head = &buf[..buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(buf.len().min(4096))];
+    let range = std::str::from_utf8(head).ok().and_then(|h| {
+        h.lines()
+            .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("range")))
+            .map(|(_, v)| v.trim().to_string())
+    });
+    Some((method.to_string(), path, range))
+}
+
+/// One run of GET requests for the same path on one forwarded stream.
+struct FileSession {
+    path: String,
+    started: Instant,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct FileTrackerState {
+    current: Option<FileSession>,
+    /// The direction carrying the file payload — the opposite of wherever
+    /// request lines are seen (to_peer on the connect side, from_peer on the
+    /// listen side).
+    data_direction: Option<&'static str>,
+}
+
+/// Per-stream file attribution shared by both copy directions.
+struct FileTracker {
+    conn_id: u64,
+    state: std::sync::Mutex<FileTrackerState>,
+}
+
+impl FileTracker {
+    fn new(conn_id: u64) -> Self {
+        Self {
+            conn_id,
+            state: Default::default(),
+        }
+    }
+
+    /// Inspect one forwarded buffer: request lines open/continue read
+    /// sessions, payload buffers feed the current session's byte count.
+    fn observe(&self, direction: &'static str, chunk: &[u8]) {
+        if let Some((method, path, range)) = parse_http_request(chunk) {
+            let mut st = self.state.lock().unwrap();
+            if method == "GET" {
+                metrics::file_request(&path);
+                st.data_direction = Some(if direction == "to_peer" {
+                    "from_peer"
+                } else {
+                    "to_peer"
+                });
+                match &mut st.current {
+                    Some(session) if session.path == path => {
+                        tracing::debug!(
+                            conn = self.conn_id,
+                            file = %path,
+                            range = range.as_deref().unwrap_or(""),
+                            "file chunk request"
+                        );
+                    }
+                    _ => {
+                        if let Some(previous) = st.current.take() {
+                            close_file_session(self.conn_id, previous);
+                        }
+                        tracing::info!(
+                            conn = self.conn_id,
+                            file = %path,
+                            range = range.as_deref().unwrap_or(""),
+                            "file read start"
+                        );
+                        metrics::file_session_started(&path);
+                        st.current = Some(FileSession {
+                            path,
+                            started: Instant::now(),
+                            bytes: 0,
+                        });
+                    }
+                }
+            } else {
+                tracing::debug!(conn = self.conn_id, method = %method, path = %path, "webdav request");
+            }
+        } else {
+            let mut st = self.state.lock().unwrap();
+            if st.data_direction == Some(direction) {
+                if let Some(session) = &mut st.current {
+                    session.bytes += chunk.len() as u64;
+                    metrics::file_bytes(&session.path, chunk.len() as u64);
+                }
+            }
+        }
+    }
+
+    /// The stream is done — close any open session.
+    fn finish(&self) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(session) = st.current.take() {
+            close_file_session(self.conn_id, session);
+        }
+    }
+}
+
+/// Log the end of a read session and feed the per-file metrics.
+fn close_file_session(conn_id: u64, session: FileSession) {
+    let elapsed = session.started.elapsed();
+    let secs = elapsed.as_secs_f64().max(1e-9);
+    let mib = session.bytes as f64 / 1_048_576.0;
+    tracing::info!(
+        conn = conn_id,
+        file = %session.path,
+        mib = format_args!("{:.2}", mib),
+        duration_s = format_args!("{:.2}", secs),
+        avg_mib_s = format_args!("{:.2}", mib / secs),
+        "file read closed"
+    );
+    metrics::file_session_closed(&session.path, elapsed);
+}
+
 /// Copy `from` into `to` while feeding the byte counter and emitting a speed
 /// log line every [`CHUNK_LOG_BYTES`] per direction. Local addition
 /// (fs-portal): replaces `tokio::io::copy` so per-stream throughput is
@@ -334,6 +505,7 @@ async fn instrumented_copy(
     conn_id: u64,
     direction: &'static str,
     counter: &'static AtomicU64,
+    tracker: &FileTracker,
 ) -> io::Result<u64> {
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -345,6 +517,7 @@ async fn instrumented_copy(
             break;
         }
         to.write_all(&buf[..n]).await?;
+        tracker.observe(direction, &buf[..n]);
         total += n as u64;
         chunk_bytes += n as u64;
         counter.fetch_add(n as u64, Ordering::Relaxed);
@@ -455,13 +628,16 @@ async fn forward_bidi(
     let token1 = CancellationToken::new();
     let token2 = token1.clone();
     let token3 = token1.clone();
+    let tracker = Arc::new(FileTracker::new(conn_id));
+    let tracker1 = tracker.clone();
+    let tracker2 = tracker.clone();
     let forward_from_stdin = tokio::spawn(async move {
-        copy_to_noq(from1, to2, token1.clone(), conn_id)
+        copy_to_noq(from1, to2, token1.clone(), conn_id, tracker1)
             .await
             .map_err(cancel_token(token1))
     });
     let forward_to_stdout = tokio::spawn(async move {
-        copy_from_noq(from2, to1, token2.clone(), conn_id)
+        copy_from_noq(from2, to1, token2.clone(), conn_id, tracker2)
             .await
             .map_err(cancel_token(token2))
     });
@@ -473,6 +649,7 @@ async fn forward_bidi(
     let res_from_peer = forward_to_stdout.await.anyerr().and_then(|r| r.anyerr());
     let res_to_peer = forward_from_stdin.await.anyerr().and_then(|r| r.anyerr());
 
+    tracker.finish();
     let elapsed = started.elapsed();
     metrics::CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
     metrics::CONNECTIONS_CLOSED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -1105,6 +1282,83 @@ async fn main() -> Result<()> {
             eprintln!("error: {e}");
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod file_tracking_tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_handles_spaces_and_utf8() {
+        assert_eq!(percent_decode("/Movies/Big%20Movie%20(2020)"), "/Movies/Big Movie (2020)");
+        assert_eq!(percent_decode("/plain/path.mkv"), "/plain/path.mkv");
+        assert_eq!(percent_decode("/bad%zz"), "/bad%zz");
+    }
+
+    #[test]
+    fn parses_get_with_range() {
+        let buf =
+            b"GET /Movies/Big%20Movie/big.mkv HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1023\r\n\r\n";
+        let (method, path, range) = parse_http_request(buf).unwrap();
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/Movies/Big Movie/big.mkv");
+        assert_eq!(range.as_deref(), Some("bytes=0-1023"));
+    }
+
+    #[test]
+    fn parses_propfind_without_range() {
+        let buf = b"PROPFIND /Movies/ HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (method, path, range) = parse_http_request(buf).unwrap();
+        assert_eq!(method, "PROPFIND");
+        assert_eq!(path, "/Movies/");
+        assert_eq!(range, None);
+    }
+
+    #[test]
+    fn payload_and_responses_are_not_requests() {
+        assert!(parse_http_request(b"HTTP/1.1 200 OK\r\n\r\n").is_none());
+        assert!(parse_http_request(&[0u8, 1, 2, 3, 255, 254]).is_none());
+        assert!(parse_http_request(b"GETTING THERE\r\n").is_none());
+        assert!(parse_http_request(b"").is_none());
+    }
+
+    #[test]
+    fn tracker_attributes_payload_bytes_to_current_file() {
+        let tracker = FileTracker::new(999);
+        // request seen going to the peer -> payload comes from the peer
+        tracker.observe(
+            "to_peer",
+            b"GET /t/unique-tracker-test.bin HTTP/1.1\r\nRange: bytes=0-99\r\n\r\n",
+        );
+        tracker.observe("from_peer", &[0u8; 100]);
+        {
+            let st = tracker.state.lock().unwrap();
+            let session = st.current.as_ref().unwrap();
+            assert_eq!(session.path, "/t/unique-tracker-test.bin");
+            assert_eq!(session.bytes, 100);
+        }
+        // same-path chunk request continues the session
+        tracker.observe(
+            "to_peer",
+            b"GET /t/unique-tracker-test.bin HTTP/1.1\r\nRange: bytes=100-199\r\n\r\n",
+        );
+        tracker.observe("from_peer", &[0u8; 50]);
+        assert_eq!(tracker.state.lock().unwrap().current.as_ref().unwrap().bytes, 150);
+        // a different path closes the old session and opens a new one
+        tracker.observe("to_peer", b"GET /t/other.bin HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            tracker.state.lock().unwrap().current.as_ref().unwrap().path,
+            "/t/other.bin"
+        );
+        tracker.finish();
+        assert!(tracker.state.lock().unwrap().current.is_none());
+        // metrics registry saw the bytes
+        let rendered = metrics::render();
+        assert!(rendered
+            .contains("dumbpipe_file_bytes_sent_total{file=\"/t/unique-tracker-test.bin\"} 150"));
+        assert!(rendered
+            .contains("dumbpipe_file_requests_total{file=\"/t/unique-tracker-test.bin\"} 2"));
     }
 }
 

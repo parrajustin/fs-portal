@@ -260,6 +260,11 @@ Everything is observable from `docker logs` and four Prometheus endpoints.
   Queueing on `FSP_MAX_STREAMS` is logged when it happens. Verbosity is the
   standard `RUST_LOG` filter (default `dumbpipe=info`; set `dumbpipe=debug`
   or `iroh=debug` for connection internals).
+- **Per-file lines** (both sides): dumbpipe sniffs the tunneled WebDAV
+  requests, so you see *which file* is moving — `file read start` (`file`,
+  `range`), and `file read closed` when reading stops, with `mib`,
+  `duration_s`, and `avg_mib_s` for that file. Same-file chunk requests and
+  non-GET webdav traffic (PROPFIND listings) log at `dumbpipe=debug`.
 - `[rclone-serve]` — every WebDAV request the peer makes, at
   `FSP_RCLONE_LOG_LEVEL` (default `INFO`).
 - `[rclone-mount]` — VFS/cache activity plus a one-line transfer stats
@@ -273,8 +278,8 @@ default — add `ports:` to scrape from outside; `FSP_METRICS=0` disables all):
 | --- | --- | --- |
 | `9101` | rclone serve (transmitter) | rclone core + HTTP server metrics |
 | `9102` | rclone mount (receiver) | rclone VFS/cache/transfer metrics |
-| `9103` | dumbpipe listen (transmitter) | `dumbpipe_connections_total/active/closed`, `dumbpipe_bytes_{to,from}_peer_total`, `dumbpipe_connection_errors_total`, `dumbpipe_queue_waits_total`, `dumbpipe_stream_duration_ms_total` |
-| `9104` | dumbpipe metrics server (receiver) | same counters, receiver side — every tunnel process pushes to this one central server, samples labeled `proc="dpN"`, plus a `dumbpipe_metrics_push_age_seconds` freshness gauge per process |
+| `9103` | dumbpipe listen (transmitter) | `dumbpipe_connections_total/active/closed`, `dumbpipe_bytes_{to,from}_peer_total`, `dumbpipe_connection_errors_total`, `dumbpipe_queue_waits_total`, `dumbpipe_stream_duration_ms_total`, plus per-file families `dumbpipe_file_{bytes_sent,requests,read_seconds}_total` and `dumbpipe_file_active_reads`, labeled `file="/path"` (bounded to the `DUMBPIPE_FILE_METRICS_MAX` most recent files, default 128) |
+| `9104` | dumbpipe metrics server (receiver) | same counters (including the per-file families), receiver side — every tunnel process pushes to this one central server, samples labeled `proc="dpN"` (per-file samples get both `file` and `proc`), plus a `dumbpipe_metrics_push_age_seconds` freshness gauge per process |
 
 Scrape example (add to the fs-portal service: `ports: ["9101-9104:9101-9104"]`):
 
@@ -317,6 +322,7 @@ stays pinned.
 | `FSP_RCLONE_LOG_LEVEL` | `INFO` | rclone log level (`DEBUG` for per-read detail) |
 | `FSP_STATS_INTERVAL` | `60s` | rclone mount transfer-stats log cadence |
 | `RUST_LOG` | `dumbpipe=info` | dumbpipe/tracing filter (`dumbpipe=debug`, `iroh=debug`) |
+| `DUMBPIPE_FILE_METRICS_MAX` | `128` | max per-file metric series kept (least-recently-read evicted; `0` disables per-file metrics) |
 
 Container needs: `cap_add: SYS_ADMIN`, `devices: /dev/fuse`,
 `security_opt: apparmor:unconfined`, and the portal dir bound `:rshared`

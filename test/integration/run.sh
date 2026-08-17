@@ -250,6 +250,27 @@ t "stream start logged" "yes" "$(echo "$logs" | grep -q 'stream start' && echo y
 t "stream close logged with speed" "yes" "$(echo "$logs" | grep -q 'stream closed' && echo yes)"
 t "rclone mount logs at INFO" "yes" "$(echo "$logs" | grep -q 'INFO' && echo yes)"
 
+echo "== observability: per-file logs and metrics =="
+# dumbpipe sniffs the tunneled webdav requests: which file, bytes, avg speed,
+# and when reading stopped — on both sides, in logs and metric families.
+exp_logs="$(docker logs "$EXP" 2>&1)"
+t "transmitter logs which file is read" "yes" \
+  "$(echo "$exp_logs" | grep 'file read start' | grep -q 'big.movie.2020.mkv' && echo yes)"
+t "transmitter logs read end with avg speed" "yes" \
+  "$(echo "$exp_logs" | grep 'file read closed' | grep -q 'avg_mib_s' && echo yes)"
+t "receiver logs which file is read" "yes" \
+  "$(echo "$logs" | grep 'file read' | grep -q 'big.movie.2020.mkv' && echo yes)"
+# per-file metrics: check the receiver's central server — its tunnel
+# processes were never restarted, so their counters span the whole run
+fm="$(scrape "$IMP" 9104 'dumbpipe_file_bytes_sent_total')"
+t "per-file metrics exposed" "yes" "$([[ -n "$fm" ]] && echo yes)"
+movie_bytes="$(echo "$fm" | grep '^dumbpipe_file_bytes_sent_total{file="/Movies/Big Movie (2020)/big.movie.2020.mkv"' | awk '{s+=$NF} END{print s+0}')"
+t "movie bytes attributed to its file (>=8MB)" "yes" "$([[ "${movie_bytes:-0}" -ge 8388608 ]] && echo yes)"
+t "per-file read seconds tracked" "yes" \
+  "$(echo "$fm" | grep -q '^dumbpipe_file_read_seconds_total{file=' && echo yes)"
+t "per-file requests counted" "yes" \
+  "$(echo "$fm" | grep -q '^dumbpipe_file_requests_total{file="/Movies/Big Movie (2020)/big.movie.2020.mkv"' && echo yes)"
+
 echo "== fixed receiver: ticket is a pure function of IROH_SECRET =="
 # Cycle one transmitter through secrets A -> A -> B -> A across full
 # stop/starts (fresh container + fresh /config each time, so nothing but the
