@@ -50,6 +50,24 @@ fsp_roles() {
   echo "${out[*]}"
 }
 
+# Normalize/validate FSP_MAX_STREAMS: the max number of files the portal will
+# stream concurrently, enforced by dumbpipe on both sides (each concurrent
+# read occupies one forwarded connection). Empty defaults to 5; 0 disables
+# the cap. Echoes the normalized number; rc=1 on junk.
+fsp_max_streams() {
+  local raw="${1-}"
+  raw="${raw//[[:space:]]/}"
+  if [[ -z "$raw" ]]; then
+    echo 5
+    return 0
+  fi
+  if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+    echo "fs-portal: FSP_MAX_STREAMS must be a non-negative integer (0 = unlimited), got '$1'" >&2
+    return 1
+  fi
+  echo $((10#$raw))
+}
+
 # rclone argv (newline-separated) serving EXPORT_DIR read-only over WebDAV,
 # bound to localhost only — dumbpipe is the sole way in from outside.
 fsp_serve_args() {

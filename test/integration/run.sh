@@ -31,18 +31,28 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== fixtures =="
-mkdir -p "$WORK/media/Movies/Big Movie (2020)" "$WORK/media/Shows/Some Show/Season 01" "$WORK/config"
+mkdir -p "$WORK/media/Movies/Big Movie (2020)" "$WORK/media/Shows/Some Show/Season 01" \
+  "$WORK/media/cap" "$WORK/config"
 head -c $((8 * 1024 * 1024)) /dev/urandom > "$WORK/media/Movies/Big Movie (2020)/big.movie.2020.mkv"
 head -c $((1 * 1024 * 1024)) /dev/urandom > "$WORK/media/Shows/Some Show/Season 01/e01.mkv"
 echo "hello from exporter" > "$WORK/media/note.txt"
+# fixtures for the stream-cap check: 4 files pulled in parallel later
+for i in 1 2 3 4; do
+  head -c $((32 * 1024 * 1024)) /dev/urandom > "$WORK/media/cap/cap$i.bin"
+done
 chmod -R a+rX "$WORK/media" "$WORK/config"
 
 docker network create "$NET" >/dev/null 2>&1 || true
 
 echo "== start exporter =="
 docker rm -f "$EXP" "$IMP" >/dev/null 2>&1
-docker run -d --name "$EXP" --network "$NET" \
+# FSP_MAX_STREAMS=2 on the exporter (looser 3 on the importer) so the
+# stream-cap check below can attribute the limit to the transmitter side.
+# --no-healthcheck: the background healthcheck wgets the webdav port and
+# would pollute the connection counting.
+docker run -d --name "$EXP" --network "$NET" --no-healthcheck \
   -e ROLES=export \
+  -e FSP_MAX_STREAMS=2 \
   -v "$WORK/media:/export:ro" \
   -v "$WORK/config:/config" \
   "$IMAGE" >/dev/null || { echo "FATAL: exporter failed to start"; exit 1; }
@@ -60,9 +70,10 @@ t "ticket produced" "yes" "yes"
 echo "  ticket: ${TICKET:0:32}..."
 
 echo "== start importer =="
-docker run -d --name "$IMP" --network "$NET" \
+docker run -d --name "$IMP" --network "$NET" --no-healthcheck \
   -e ROLES=import \
   -e PEER_TICKET="$TICKET" \
+  -e FSP_MAX_STREAMS=3 \
   --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
   "$IMAGE" >/dev/null || { echo "FATAL: importer failed to start"; exit 1; }
 
@@ -97,6 +108,48 @@ t "8MB file byte-identical over iroh" "$want_sha" "$got_sha"
 want_seek="$(dd if="$WORK/media/Movies/Big Movie (2020)/big.movie.2020.mkv" bs=64K skip=80 count=1 2>/dev/null | sha256sum | awk '{print $1}')"
 got_seek="$(docker exec "$IMP" sh -c "dd if='/portal/media/Movies/Big Movie (2020)/big.movie.2020.mkv' bs=64K skip=80 count=1 2>/dev/null | sha256sum" | awk '{print $1}')"
 t "mid-file seek read" "$want_seek" "$got_seek"
+
+echo "== stream cap: exporter FSP_MAX_STREAMS=2 =="
+# The exporter's dumbpipe is the only client of rclone serve on
+# 127.0.0.1:8080, and it forwards one tcp connection per concurrent stream.
+# So under a cap of 2, the exporter must never hold more than 2 established
+# connections to :8080 (1F90 hex), no matter how many reads the importer
+# fires in parallel. Sample /proc/net/tcp on the exporter while 4 raw-webdav
+# downloads run concurrently from the importer.
+docker exec -i "$EXP" sh -c 'cat > /tmp/conn-sampler.sh' <<'EOS'
+#!/bin/bash
+# record the max simultaneous client connections to 127.0.0.1:8080 (:1F90)
+echo 0 > /tmp/fsp-max-conns
+max=0
+end=$((SECONDS + 120))
+while (( SECONDS < end )); do
+  n=$(awk '$3 ~ /:1F90$/ && $4 == "01"' /proc/net/tcp | wc -l)
+  (( n > max )) && { max=$n; echo "$max" > /tmp/fsp-max-conns; }
+  sleep 0.05
+done
+EOS
+docker exec -d "$EXP" bash /tmp/conn-sampler.sh
+cap_pids=()
+for i in 1 2 3 4; do
+  docker exec "$IMP" sh -c "timeout 150 rclone --webdav-url=http://127.0.0.1:8081 --webdav-vendor=other copyto :webdav:cap/cap$i.bin /tmp/cap$i.bin 2>/dev/null" &
+  cap_pids+=($!)
+done
+cap_rc=0
+for p in "${cap_pids[@]}"; do wait "$p" || cap_rc=1; done
+t "4 parallel downloads all complete under the cap (rc)" 0 $cap_rc
+cap_sha_ok=yes
+for i in 1 2 3 4; do
+  want="$(sha256sum "$WORK/media/cap/cap$i.bin" | awk '{print $1}')"
+  got="$(docker exec "$IMP" sh -c "sha256sum /tmp/cap$i.bin" | awk '{print $1}')"
+  [[ "$want" == "$got" ]] || cap_sha_ok="no (cap$i.bin)"
+done
+t "parallel downloads byte-identical" "yes" "$cap_sha_ok"
+max_conns="$(docker exec "$EXP" cat /tmp/fsp-max-conns)"
+docker exec "$EXP" pkill -f conn-sampler >/dev/null 2>&1
+echo "  observed max concurrent webdav connections: $max_conns"
+t "sampler saw traffic (max >= 1)" "yes" "$([[ "$max_conns" -ge 1 ]] && echo yes)"
+t "never more than 2 concurrent streams reach the exporter" "yes" \
+  "$([[ "$max_conns" -le 2 ]] && echo yes)"
 
 echo "== read-only enforcement: layer 1, receiver FUSE mount =="
 docker exec "$IMP" sh -c 'touch /portal/media/should-fail 2>/dev/null'; t "write rejected (rc)" 1 $?

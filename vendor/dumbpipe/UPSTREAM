@@ -7,10 +7,19 @@ Source:    https://github.com/n0-computer/dumbpipe/archive/refs/tags/v0.39.0.tar
 sha256:    89d01b0b6d25fc8baf06ab791fd0a2b35b24ac51d0bd01b64d36c35750aaf3e9
 License:   MIT OR Apache-2.0 (LICENSE-MIT / LICENSE-APACHE alongside)
 Vendored:  2026-08-15; contents are the tag's src/, tests/, Cargo.toml,
-           Cargo.lock, licenses and README, unmodified. .github/ and
-           .gitignore omitted. Dependencies are pinned by the committed
-           Cargo.lock (built with --locked).
+           Cargo.lock, licenses and README. .github/ and .gitignore
+           omitted. Dependencies are pinned by the committed Cargo.lock
+           (built with --locked).
+
+Local patches (kept minimal; re-apply when upgrading):
+  * src/main.rs: `--max-connections <N>` flag on `listen-tcp` and
+    `connect-tcp` (default 0 = unlimited, upstream behavior). A tokio
+    semaphore caps how many connections are forwarded concurrently; extra
+    connections queue until a slot frees instead of erroring. fs-portal
+    uses it to enforce FSP_MAX_STREAMS on both the export and import side.
+    Exercised by test/integration/run.sh (stream-cap checks).
 
 To upgrade: fetch a newer tag tarball, verify its sha256, replace these
-files wholesale, update this file, and re-run tools/fs-portal/test.sh
-(the build gate runs upstream's cargo tests via the dumbpipe-test stage).
+files wholesale, re-apply the local patches above, update this file, and
+re-run tools/fs-portal/test.sh (the build gate runs upstream's cargo tests
+via the dumbpipe-test stage).

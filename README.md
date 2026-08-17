@@ -207,6 +207,12 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
   no action (verified by the e2e suite).
 - **Nothing listens on your LAN**: the WebDAV server binds 127.0.0.1 inside
   the container; the only ingress is the iroh endpoint.
+- **Bounded concurrency**: at most `FSP_MAX_STREAMS` (default 5) files are
+  streamed at once. Each side enforces its own cap inside the iroh tunnel —
+  the transmitter throttles a greedy/misbehaving peer, and the receiver
+  throttles its own media server (e.g. a library scan opening every file) —
+  so one bulk read can't spiral into 100% CPU. Excess opens simply queue
+  until a slot frees; nothing errors. Set `0` to disable.
 
 ## Environment reference (fs-portal container)
 
@@ -217,6 +223,7 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
 | `PEER_TICKET` | — | other side's ticket; or file `/config/peer_ticket` (live pickup) |
 | `EXPORT_DIR` | `/export` | what you share (bind it `:ro`) |
 | `MOUNT_DIR` | `/portal/media` | where the peer's library appears |
+| `FSP_MAX_STREAMS` | `5` | max files streamed concurrently, enforced on both sides (`0` = unlimited) |
 | `FSP_VFS_CACHE_MAX_SIZE` | `2G` | local read cache for streaming |
 | `FSP_DIR_CACHE_TIME` | `30s` | how quickly new remote files appear |
 

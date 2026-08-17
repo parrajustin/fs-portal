@@ -20,6 +20,12 @@ SECRET_FILE="$CONFIG_DIR/iroh_secret"
 
 ROLES_ACTIVE="$(fsp_roles "${ROLES:-}")" || die "invalid ROLES='${ROLES:-}'"
 log "roles: $ROLES_ACTIVE"
+FSP_MAX_STREAMS="$(fsp_max_streams "${FSP_MAX_STREAMS:-}")" || die "invalid FSP_MAX_STREAMS='${FSP_MAX_STREAMS:-}'"
+if [[ "$FSP_MAX_STREAMS" -gt 0 ]]; then
+  log "max concurrent file streams: $FSP_MAX_STREAMS (FSP_MAX_STREAMS; 0 = unlimited)"
+else
+  log "max concurrent file streams: unlimited (set FSP_MAX_STREAMS to cap)"
+fi
 mkdir -p "$CONFIG_DIR"
 
 # ---- identity -------------------------------------------------------------
@@ -69,7 +75,7 @@ supervise() { # supervise <name> <cmd...> — restart forever, prefix output
 supervise_listener() {
   (
     while true; do
-      dumbpipe listen-tcp --host "127.0.0.1:$FSP_WEBDAV_PORT" 2>&1 | while IFS= read -r line; do
+      dumbpipe listen-tcp --host "127.0.0.1:$FSP_WEBDAV_PORT" --max-connections "$FSP_MAX_STREAMS" 2>&1 | while IFS= read -r line; do
         echo "[dumbpipe-listen] $line"
         ticket="$(printf '%s\n' "$line" | fsp_parse_ticket)"
         if [[ -n "$ticket" && "$(cat "$TICKET_FILE" 2>/dev/null)" != "$ticket" ]]; then
@@ -140,7 +146,7 @@ if [[ " $ROLES_ACTIVE " == *" import "* ]]; then
   fusermount3 -uz "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
 
   log "import: bridging peer's webdav to 127.0.0.1:$FSP_IMPORT_PORT over iroh"
-  supervise dumbpipe-connect dumbpipe connect-tcp --addr "127.0.0.1:$FSP_IMPORT_PORT" "$PEER_TICKET"
+  supervise dumbpipe-connect dumbpipe connect-tcp --addr "127.0.0.1:$FSP_IMPORT_PORT" --max-connections "$FSP_MAX_STREAMS" "$PEER_TICKET"
   wait_for_port "$FSP_IMPORT_PORT" 30 || die "dumbpipe connect-tcp did not open local port"
 
   mapfile -t mount_argv < <(fsp_mount_args "$MOUNT_DIR")
