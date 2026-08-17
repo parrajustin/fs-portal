@@ -1,5 +1,5 @@
 {
-  "latest_version": 3,
+  "latest_version": 4,
   "versions": [
     {
       "version": 0,
@@ -11,6 +11,12 @@
       "version": 3,
       "digests": {
         "x86_64": "sha256:97381db2d97d773d9eb6295271c3824e86746b41f7c8a02b456e325d89158227"
+      }
+    },
+    {
+      "version": 4,
+      "digests": {
+        "x86_64": "sha256:3b349186b6fea9b02067bc30375bb43c60e73aca05b3a402d8a9987d45f54e24"
       }
     }
   ]
