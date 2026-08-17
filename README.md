@@ -113,6 +113,7 @@ services:
     environment:
       - ROLES=transmitter
       - IROH_SECRET=${FS_PORTAL_SECRET} # openssl rand -hex 32
+      - FSP_MAX_STREAMS=5 # max files streamed at once (0 = unlimited)
     volumes:
       - /path/to/your/media:/export:ro
       - ${FS_PORTAL_ROOT}/config:/config # keeps identity + ticket.txt
@@ -135,6 +136,7 @@ services:
     environment:
       - ROLES=receiver
       - PEER_TICKET=${FS_PORTAL_PEER_TICKET} # ticket from the transmitter
+      - FSP_MAX_STREAMS=5 # max files streamed at once (0 = unlimited)
     volumes:
       - ${FS_PORTAL_ROOT}/portal:/portal:rshared
       - ${FS_PORTAL_ROOT}/config:/config
@@ -162,6 +164,7 @@ services:
       - ROLES=both
       - IROH_SECRET=${FS_PORTAL_SECRET}
       - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-} # empty on first boot
+      - FSP_MAX_STREAMS=5 # max files streamed at once (0 = unlimited)
     volumes:
       - /path/to/your/media:/export:ro
       - ${FS_PORTAL_ROOT}/portal:/portal:rshared
@@ -214,6 +217,54 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
   so one bulk read can't spiral into 100% CPU. Excess opens simply queue
   until a slot frees; nothing errors. Set `0` to disable.
 
+## Observability
+
+Everything is observable from `docker logs` and four Prometheus endpoints.
+
+**Logs (console, structured):**
+
+- `[dumbpipe-listen]` / `[dumbpipe-connect]` — per-stream lifecycle from the
+  vendored dumbpipe: `stream start` (with current active count),
+  `chunk forwarded` every 32 MiB per direction (`chunk_mib`, `speed_mib_s`,
+  `total_mib`), and `stream closed` with byte totals and average MiB/s per
+  direction (`duration_s`, `from_peer_mib`, `avg_from_peer_mib_s`, …).
+  Queueing on `FSP_MAX_STREAMS` is logged when it happens. Verbosity is the
+  standard `RUST_LOG` filter (default `dumbpipe=info`; set `dumbpipe=debug`
+  or `iroh=debug` for connection internals).
+- `[rclone-serve]` — every WebDAV request the peer makes, at
+  `FSP_RCLONE_LOG_LEVEL` (default `INFO`).
+- `[rclone-mount]` — VFS/cache activity plus a one-line transfer stats
+  summary every `FSP_STATS_INTERVAL` (default `60s`): cumulative bytes,
+  current speed, active transfers.
+
+**Prometheus endpoints** (in-container, bound `0.0.0.0`, *not* published by
+default — add `ports:` to scrape from outside; `FSP_METRICS=0` disables all):
+
+| Port | Process | What you get |
+| --- | --- | --- |
+| `9101` | rclone serve (transmitter) | rclone core + HTTP server metrics |
+| `9102` | rclone mount (receiver) | rclone VFS/cache/transfer metrics |
+| `9103` | dumbpipe listen (transmitter) | `dumbpipe_connections_total/active/closed`, `dumbpipe_bytes_{to,from}_peer_total`, `dumbpipe_connection_errors_total`, `dumbpipe_queue_waits_total`, `dumbpipe_stream_duration_ms_total` |
+| `9104` | dumbpipe connect (receiver) | same counters, receiver side |
+
+Scrape example (add to the fs-portal service: `ports: ["9101-9104:9101-9104"]`):
+
+```yaml
+scrape_configs:
+  - job_name: fs-portal
+    static_configs:
+      - targets: ["your-host:9101", "your-host:9102", "your-host:9103", "your-host:9104"]
+```
+
+Average stream speed in PromQL:
+`rate(dumbpipe_bytes_from_peer_total[5m])` (bytes/s), and
+`dumbpipe_stream_duration_ms_total / 1000 / dumbpipe_connections_closed_total`
+for mean stream lifetime. An OpenTelemetry collector picks all of this up
+as-is (`prometheus` receiver for the four endpoints, `filelog`/docker
+receiver for the console logs) — the dumbpipe logs are structured key=value
+`tracing` output, deliberately kept OTLP-free so the vendored `Cargo.lock`
+stays pinned.
+
 ## Environment reference (fs-portal container)
 
 | Var | Default | Meaning |
@@ -226,6 +277,12 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
 | `FSP_MAX_STREAMS` | `5` | max files streamed concurrently, enforced on both sides (`0` = unlimited) |
 | `FSP_VFS_CACHE_MAX_SIZE` | `2G` | local read cache for streaming |
 | `FSP_DIR_CACHE_TIME` | `30s` | how quickly new remote files appear |
+| `FSP_METRICS` | `1` | `0` disables all four Prometheus endpoints |
+| `FSP_SERVE_METRICS_PORT` / `FSP_MOUNT_METRICS_PORT` | `9101` / `9102` | rclone metrics ports |
+| `FSP_LISTEN_METRICS_PORT` / `FSP_CONNECT_METRICS_PORT` | `9103` / `9104` | dumbpipe metrics ports |
+| `FSP_RCLONE_LOG_LEVEL` | `INFO` | rclone log level (`DEBUG` for per-read detail) |
+| `FSP_STATS_INTERVAL` | `60s` | rclone mount transfer-stats log cadence |
+| `RUST_LOG` | `dumbpipe=info` | dumbpipe/tracing filter (`dumbpipe=debug`, `iroh=debug`) |
 
 Container needs: `cap_add: SYS_ADMIN`, `devices: /dev/fuse`,
 `security_opt: apparmor:unconfined`, and the portal dir bound `:rshared`

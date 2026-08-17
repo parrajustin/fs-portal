@@ -18,6 +18,15 @@ Local patches (kept minimal; re-apply when upgrading):
     connections queue until a slot frees instead of erroring. fs-portal
     uses it to enforce FSP_MAX_STREAMS on both the export and import side.
     Exercised by test/integration/run.sh (stream-cap checks).
+  * src/metrics.rs (new file) + src/main.rs: observability. Process-wide
+    forwarding counters (connections total/active/closed, bytes per
+    direction, errors, queue waits, stream duration) exposed as Prometheus
+    text on the address in DUMBPIPE_METRICS_ADDR (unset = disabled) via a
+    dependency-free std HTTP thread — Cargo.lock unchanged. The copy loops
+    are instrumented: per-stream "stream start"/"stream closed" logs with
+    byte totals and average MiB/s, plus a per-32MiB chunk speed log line.
+    Cargo tests live in src/metrics.rs; scraped by
+    test/integration/run.sh (metrics checks).
 
 To upgrade: fetch a newer tag tarball, verify its sha256, replace these
 files wholesale, re-apply the local patches above, update this file, and

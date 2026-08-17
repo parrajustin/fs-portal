@@ -28,6 +28,24 @@ else
 fi
 mkdir -p "$CONFIG_DIR"
 
+# ---- observability --------------------------------------------------------
+# Structured per-stream logs from dumbpipe (start/close, per-chunk speed);
+# RUST_LOG is the standard tracing filter, overridable for debug.
+export RUST_LOG="${RUST_LOG:-dumbpipe=info}"
+# Prometheus endpoints (FSP_METRICS=0 disables all four; only reachable if
+# the user publishes the ports):
+#   9101 rclone serve   9102 rclone mount
+#   9103 dumbpipe listen (transmitter)   9104 dumbpipe connect (receiver)
+DP_LISTEN_METRICS=()
+DP_CONNECT_METRICS=()
+if [[ "${FSP_METRICS:-1}" != 0 ]]; then
+  DP_LISTEN_METRICS=(env "DUMBPIPE_METRICS_ADDR=0.0.0.0:${FSP_LISTEN_METRICS_PORT:-9103}")
+  DP_CONNECT_METRICS=(env "DUMBPIPE_METRICS_ADDR=0.0.0.0:${FSP_CONNECT_METRICS_PORT:-9104}")
+  log "metrics: rclone :${FSP_SERVE_METRICS_PORT:-9101}(serve)/:${FSP_MOUNT_METRICS_PORT:-9102}(mount), dumbpipe :${FSP_LISTEN_METRICS_PORT:-9103}(listen)/:${FSP_CONNECT_METRICS_PORT:-9104}(connect) — publish the ports to scrape (FSP_METRICS=0 disables)"
+else
+  log "metrics: disabled (FSP_METRICS=0)"
+fi
+
 # ---- identity -------------------------------------------------------------
 # One stable secret per computer => stable node id => the ticket you hand to
 # the other side never changes ("fixed receiver").
@@ -75,7 +93,7 @@ supervise() { # supervise <name> <cmd...> — restart forever, prefix output
 supervise_listener() {
   (
     while true; do
-      dumbpipe listen-tcp --host "127.0.0.1:$FSP_WEBDAV_PORT" --max-connections "$FSP_MAX_STREAMS" 2>&1 | while IFS= read -r line; do
+      "${DP_LISTEN_METRICS[@]}" dumbpipe listen-tcp --host "127.0.0.1:$FSP_WEBDAV_PORT" --max-connections "$FSP_MAX_STREAMS" 2>&1 | while IFS= read -r line; do
         echo "[dumbpipe-listen] $line"
         ticket="$(printf '%s\n' "$line" | fsp_parse_ticket)"
         if [[ -n "$ticket" && "$(cat "$TICKET_FILE" 2>/dev/null)" != "$ticket" ]]; then
@@ -146,7 +164,7 @@ if [[ " $ROLES_ACTIVE " == *" import "* ]]; then
   fusermount3 -uz "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
 
   log "import: bridging peer's webdav to 127.0.0.1:$FSP_IMPORT_PORT over iroh"
-  supervise dumbpipe-connect dumbpipe connect-tcp --addr "127.0.0.1:$FSP_IMPORT_PORT" --max-connections "$FSP_MAX_STREAMS" "$PEER_TICKET"
+  supervise dumbpipe-connect "${DP_CONNECT_METRICS[@]}" dumbpipe connect-tcp --addr "127.0.0.1:$FSP_IMPORT_PORT" --max-connections "$FSP_MAX_STREAMS" "$PEER_TICKET"
   wait_for_port "$FSP_IMPORT_PORT" 30 || die "dumbpipe connect-tcp did not open local port"
 
   mapfile -t mount_argv < <(fsp_mount_args "$MOUNT_DIR")

@@ -97,16 +97,25 @@ fsp_max_streams "3.5" >/dev/null 2>&1; t "fraction rejected (rc)" 1 $?
 
 echo "== fsp_serve_args =="
 # Contract: newline-separated argv for `rclone`, serving EXPORT_DIR read-only
-# on 127.0.0.1:$FSP_WEBDAV_PORT only.
-args="$(EXPORT_DIR=/export FSP_WEBDAV_PORT=8080 fsp_serve_args)"
-t "serve argv" \
+# on 127.0.0.1:$FSP_WEBDAV_PORT only. FSP_METRICS=0 disables the metrics
+# endpoint; request logging is always on at FSP_RCLONE_LOG_LEVEL.
+args="$(EXPORT_DIR=/export FSP_WEBDAV_PORT=8080 FSP_METRICS=0 fsp_serve_args)"
+t "serve argv (metrics off)" \
 "serve
 webdav
 /export
 --addr
 127.0.0.1:8080
---read-only" \
+--read-only
+--log-level=INFO" \
 "$args"
+
+args="$(EXPORT_DIR=/export fsp_serve_args)"
+t "serve metrics on by default" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--metrics-addr=0.0.0.0:9101' && echo yes)"
+args="$(EXPORT_DIR=/export FSP_SERVE_METRICS_PORT=19101 fsp_serve_args)"
+t "serve metrics port override" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--metrics-addr=0.0.0.0:19101' && echo yes)"
+args="$(EXPORT_DIR=/export FSP_RCLONE_LOG_LEVEL=DEBUG fsp_serve_args)"
+t "serve log level override" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--log-level=DEBUG' && echo yes)"
 
 echo "== fsp_mount_args =="
 # Contract: mounts the webdav remote (proxied peer) at $1, read-only,
@@ -119,6 +128,21 @@ t "mount argv allow-other" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--allow
 t "mount argv vfs cache" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--vfs-cache-mode=full' && echo yes)"
 t "mount argv target" "yes" "$(printf '%s\n' "$args" | grep -qx -- '/portal/media' && echo yes)"
 t "mount argv points at import port" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--webdav-url=http://127.0.0.1:8081' && echo yes)"
+
+echo "== fsp_mount_args observability =="
+# Metrics endpoint on 9102 (togglable), INFO logs, and periodic one-line
+# transfer stats so speeds show up in `docker logs`.
+args="$(fsp_mount_args /portal/media)"
+t "mount metrics on by default" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--metrics-addr=0.0.0.0:9102' && echo yes)"
+t "mount log level default INFO" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--log-level=INFO' && echo yes)"
+t "mount periodic stats" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--stats=60s' && echo yes)"
+t "mount stats one-line" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--stats-one-line' && echo yes)"
+args="$(FSP_METRICS=0 fsp_mount_args /portal/media)"
+t "mount metrics disabled by FSP_METRICS=0" "yes" "$(printf '%s\n' "$args" | grep -q -- '--metrics-addr' && echo no || echo yes)"
+args="$(FSP_MOUNT_METRICS_PORT=19102 fsp_mount_args /portal/media)"
+t "mount metrics port override" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--metrics-addr=0.0.0.0:19102' && echo yes)"
+args="$(FSP_STATS_INTERVAL=30s fsp_mount_args /portal/media)"
+t "mount stats interval override" "yes" "$(printf '%s\n' "$args" | grep -qx -- '--stats=30s' && echo yes)"
 
 echo
 echo "unit: $PASS passed, $FAIL failed"

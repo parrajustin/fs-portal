@@ -3,8 +3,11 @@ use std::{
     io,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     str::FromStr,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand};
@@ -15,11 +18,14 @@ use iroh::{
 };
 use n0_error::{bail_any, ensure_any, AnyError, Result, StdResultExt};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     select,
     sync::{OwnedSemaphorePermit, Semaphore},
     time::timeout,
 };
+
+// Local addition (fs-portal): forwarding metrics + optional Prometheus endpoint.
+mod metrics;
 use tokio_util::sync::CancellationToken;
 #[cfg(unix)]
 use {
@@ -257,13 +263,14 @@ pub struct ConnectUnixArgs {
 ///
 /// Returns the number of bytes copied in case of success.
 async fn copy_to_noq(
-    mut from: impl AsyncRead + Unpin,
+    from: impl AsyncRead + Unpin,
     mut send: noq::SendStream,
     token: CancellationToken,
+    conn_id: u64,
 ) -> io::Result<u64> {
     tracing::trace!("copying to noq");
     tokio::select! {
-        res = tokio::io::copy(&mut from, &mut send) => {
+        res = instrumented_copy(from, &mut send, conn_id, "to_peer", &metrics::BYTES_TO_PEER_TOTAL) => {
             let size = res?;
             send.finish()?;
             Ok(size)
@@ -286,9 +293,10 @@ async fn copy_from_noq(
     mut recv: noq::RecvStream,
     mut to: impl AsyncWrite + Unpin,
     token: CancellationToken,
+    conn_id: u64,
 ) -> io::Result<u64> {
     tokio::select! {
-        res = tokio::io::copy(&mut recv, &mut to) => {
+        res = instrumented_copy(&mut recv, &mut to, conn_id, "from_peer", &metrics::BYTES_FROM_PEER_TOTAL) => {
             Ok(res?)
         },
         _ = token.cancelled() => {
@@ -296,6 +304,51 @@ async fn copy_from_noq(
             Err(io::Error::other("cancelled"))
         }
     }
+}
+
+/// How many forwarded bytes between per-chunk speed log lines.
+const CHUNK_LOG_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Copy `from` into `to` while feeding the byte counter and emitting a speed
+/// log line every [`CHUNK_LOG_BYTES`] per direction. Local addition
+/// (fs-portal): replaces `tokio::io::copy` so per-stream throughput is
+/// observable in logs and metrics.
+async fn instrumented_copy(
+    mut from: impl AsyncRead + Unpin,
+    to: &mut (impl AsyncWrite + Unpin),
+    conn_id: u64,
+    direction: &'static str,
+    counter: &'static AtomicU64,
+) -> io::Result<u64> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    let mut chunk_bytes: u64 = 0;
+    let mut chunk_started = Instant::now();
+    loop {
+        let n = from.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        to.write_all(&buf[..n]).await?;
+        total += n as u64;
+        chunk_bytes += n as u64;
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+        if chunk_bytes >= CHUNK_LOG_BYTES {
+            let secs = chunk_started.elapsed().as_secs_f64().max(1e-9);
+            tracing::info!(
+                conn = conn_id,
+                direction,
+                chunk_mib = format_args!("{:.1}", chunk_bytes as f64 / 1_048_576.0),
+                speed_mib_s = format_args!("{:.1}", chunk_bytes as f64 / 1_048_576.0 / secs),
+                total_mib = format_args!("{:.1}", total as f64 / 1_048_576.0),
+                "chunk forwarded"
+            );
+            chunk_bytes = 0;
+            chunk_started = Instant::now();
+        }
+    }
+    to.flush().await?;
+    Ok(total)
 }
 
 /// Get the secret key or generate a new one.
@@ -354,6 +407,7 @@ async fn acquire_slot(limiter: &Option<Arc<Semaphore>>) -> Result<Option<OwnedSe
     match limiter {
         Some(semaphore) => {
             if semaphore.available_permits() == 0 {
+                metrics::QUEUE_WAITS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("max connections reached, queueing until a slot frees up");
             }
             let permit = semaphore
@@ -376,16 +430,23 @@ async fn forward_bidi(
     from2: noq::RecvStream,
     to2: noq::SendStream,
 ) -> Result<()> {
+    static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+    metrics::CONNECTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let active = metrics::CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = Instant::now();
+    tracing::info!(conn = conn_id, active, "stream start");
+
     let token1 = CancellationToken::new();
     let token2 = token1.clone();
     let token3 = token1.clone();
     let forward_from_stdin = tokio::spawn(async move {
-        copy_to_noq(from1, to2, token1.clone())
+        copy_to_noq(from1, to2, token1.clone(), conn_id)
             .await
             .map_err(cancel_token(token1))
     });
     let forward_to_stdout = tokio::spawn(async move {
-        copy_from_noq(from2, to1, token2.clone())
+        copy_from_noq(from2, to1, token2.clone(), conn_id)
             .await
             .map_err(cancel_token(token2))
     });
@@ -394,8 +455,39 @@ async fn forward_bidi(
         token3.cancel();
         io::Result::Ok(())
     });
-    forward_to_stdout.await.anyerr()?.anyerr()?;
-    forward_from_stdin.await.anyerr()?.anyerr()?;
+    let res_from_peer = forward_to_stdout.await.anyerr().and_then(|r| r.anyerr());
+    let res_to_peer = forward_from_stdin.await.anyerr().and_then(|r| r.anyerr());
+
+    let elapsed = started.elapsed();
+    metrics::CONNECTIONS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    metrics::CONNECTIONS_CLOSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    metrics::STREAM_DURATION_MS_TOTAL.fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
+    let secs = elapsed.as_secs_f64().max(1e-9);
+    let mib = |b: &u64| *b as f64 / 1_048_576.0;
+    match (&res_from_peer, &res_to_peer) {
+        (Ok(from_peer), Ok(to_peer)) => {
+            tracing::info!(
+                conn = conn_id,
+                duration_s = format_args!("{:.2}", secs),
+                from_peer_mib = format_args!("{:.2}", mib(from_peer)),
+                to_peer_mib = format_args!("{:.2}", mib(to_peer)),
+                avg_from_peer_mib_s = format_args!("{:.2}", mib(from_peer) / secs),
+                avg_to_peer_mib_s = format_args!("{:.2}", mib(to_peer) / secs),
+                "stream closed"
+            );
+        }
+        (from_peer, to_peer) => {
+            tracing::warn!(
+                conn = conn_id,
+                duration_s = format_args!("{:.2}", secs),
+                from_peer = ?from_peer.as_ref().map(mib),
+                to_peer = ?to_peer.as_ref().map(mib),
+                "stream closed with error"
+            );
+        }
+    }
+    res_from_peer?;
+    res_to_peer?;
     Ok(())
 }
 
@@ -582,6 +674,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
+                metrics::CONNECTION_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("error handling connection: {}", cause);
             }
         });
@@ -681,6 +774,7 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
+                metrics::CONNECTION_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("error handling connection: {}", cause);
             }
         });
@@ -791,6 +885,7 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
+                metrics::CONNECTION_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("error handling connection: {}", cause);
             }
         });
@@ -908,6 +1003,7 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
+                metrics::CONNECTION_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!("error handling connection: {}", cause);
             }
             tracing::trace!("handler task finished");
@@ -929,6 +1025,9 @@ async fn generate_ticket() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+    // Local addition (fs-portal): serve Prometheus metrics when
+    // DUMBPIPE_METRICS_ADDR is set.
+    metrics::spawn_server_from_env();
     let args = Args::parse();
     let res = match args.command {
         Commands::GenerateTicket => generate_ticket().await,

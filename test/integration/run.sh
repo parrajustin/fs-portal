@@ -186,6 +186,42 @@ for _ in $(seq 1 90); do
 done
 t "reads recover after exporter restart" "yes" "$recovered"
 
+echo "== observability: prometheus endpoints =="
+# rclone serve (9101) and rclone mount (9102) expose rclone's native metrics;
+# the vendored dumbpipe exposes forwarding counters on 9103 (listen) and
+# 9104 (connect). All bind 0.0.0.0 in-container but nothing is published.
+# retry each scrape briefly: the exporter was just restarted above and its
+# supervised processes respawn on a 2s cadence
+scrape() { # scrape <container> <port> <marker-regex>
+  local i m
+  for i in $(seq 1 15); do
+    m="$(docker exec "$1" wget -qO- -T 3 "http://127.0.0.1:$2/metrics" 2>/dev/null)"
+    if echo "$m" | grep -q "$3"; then echo "$m"; return 0; fi
+    sleep 1
+  done
+  echo ""
+}
+m="$(scrape "$EXP" 9101 '^go_\|^rclone')"
+t "rclone serve metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
+m="$(scrape "$IMP" 9102 '^go_\|^rclone')"
+t "rclone mount metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
+m="$(scrape "$EXP" 9103 '^dumbpipe_connections_total')"
+t "dumbpipe listen metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
+m="$(scrape "$IMP" 9104 '^dumbpipe_connections_total')"
+t "dumbpipe connect metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
+# the importer's dumbpipe survived the whole run: it must have counted the
+# earlier transfers (8MB movie + parallel caps) as bytes from the peer
+bytes_from_peer="$(echo "$m" | awk '/^dumbpipe_bytes_from_peer_total /{print $2}')"
+t "dumbpipe counted transferred bytes (>1MB)" "yes" "$([[ "${bytes_from_peer:-0}" -gt 1000000 ]] && echo yes)"
+conns="$(echo "$m" | awk '/^dumbpipe_connections_total /{print $2}')"
+t "dumbpipe counted connections (>=1)" "yes" "$([[ "${conns:-0}" -ge 1 ]] && echo yes)"
+
+echo "== observability: stream logs =="
+logs="$(docker logs "$IMP" 2>&1)"
+t "stream start logged" "yes" "$(echo "$logs" | grep -q 'stream start' && echo yes)"
+t "stream close logged with speed" "yes" "$(echo "$logs" | grep -q 'stream closed' && echo yes)"
+t "rclone mount logs at INFO" "yes" "$(echo "$logs" | grep -q 'INFO' && echo yes)"
+
 echo
 echo "integration: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

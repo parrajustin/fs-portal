@@ -70,6 +70,9 @@ fsp_max_streams() {
 
 # rclone argv (newline-separated) serving EXPORT_DIR read-only over WebDAV,
 # bound to localhost only — dumbpipe is the sole way in from outside.
+# Observability: INFO request logging always; Prometheus metrics on
+# 0.0.0.0:$FSP_SERVE_METRICS_PORT unless FSP_METRICS=0 (only reachable if the
+# user publishes the port — nothing is exposed by default).
 fsp_serve_args() {
   printf '%s\n' \
     serve \
@@ -77,7 +80,11 @@ fsp_serve_args() {
     "${EXPORT_DIR:-/export}" \
     --addr \
     "127.0.0.1:${FSP_WEBDAV_PORT:-8080}" \
-    --read-only
+    --read-only \
+    "--log-level=${FSP_RCLONE_LOG_LEVEL:-INFO}"
+  if [[ "${FSP_METRICS:-1}" != 0 ]]; then
+    printf '%s\n' "--metrics-addr=0.0.0.0:${FSP_SERVE_METRICS_PORT:-9101}"
+  fi
 }
 
 # rclone argv (newline-separated) FUSE-mounting the peer's WebDAV (as exposed
@@ -103,5 +110,11 @@ fsp_mount_args() {
     "--dir-cache-time=${FSP_DIR_CACHE_TIME:-30s}" \
     --poll-interval=0 \
     --low-level-retries=20 \
-    --retries=10
+    --retries=10 \
+    "--log-level=${FSP_RCLONE_LOG_LEVEL:-INFO}" \
+    "--stats=${FSP_STATS_INTERVAL:-60s}" \
+    --stats-one-line
+  if [[ "${FSP_METRICS:-1}" != 0 ]]; then
+    printf '%s\n' "--metrics-addr=0.0.0.0:${FSP_MOUNT_METRICS_PORT:-9102}"
+  fi
 }

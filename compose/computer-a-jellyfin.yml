@@ -20,6 +20,7 @@ services:
       - ROLES=both
       - IROH_SECRET=${FS_PORTAL_SECRET}
       - PEER_TICKET=${FS_PORTAL_PEER_TICKET:-}
+      - FSP_MAX_STREAMS=5 # max files streamed at once (0 = unlimited)
     volumes:
       # everything under /export is what your friend will see (read-only)
       - ${UPLOAD_LOCATION}:/export:ro
