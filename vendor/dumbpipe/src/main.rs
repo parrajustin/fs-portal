@@ -112,6 +112,21 @@ pub enum Commands {
     /// As far as the endpoint is concerned, this is connecting. But it is
     /// listening on a Unix socket for which you have to specify the path.
     ConnectUnix(ConnectUnixArgs),
+
+    /// Local addition (fs-portal): central Prometheus metrics server.
+    ///
+    /// Forwarding processes push their labeled metrics here (enable with
+    /// DUMBPIPE_METRICS_PUSH_ADDR + DUMBPIPE_METRICS_INSTANCE; POST
+    /// /push?instance=NAME) and a single port serves the merged families to
+    /// Prometheus (any GET path answers, so /metrics works).
+    MetricsServer(MetricsServerArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct MetricsServerArgs {
+    /// The address to serve the merged metrics endpoint on, e.g. 0.0.0.0:9104.
+    #[clap(long)]
+    pub addr: String,
 }
 
 #[derive(Parser, Debug)]
@@ -1026,8 +1041,10 @@ async fn generate_ticket() -> Result<()> {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     // Local addition (fs-portal): serve Prometheus metrics when
-    // DUMBPIPE_METRICS_ADDR is set.
+    // DUMBPIPE_METRICS_ADDR is set, or push them to a central
+    // `dumbpipe metrics-server` when DUMBPIPE_METRICS_PUSH_ADDR is set.
     metrics::spawn_server_from_env();
+    metrics::spawn_push_from_env();
     let args = Args::parse();
     let res = match args.command {
         Commands::GenerateTicket => generate_ticket().await,
@@ -1041,6 +1058,8 @@ async fn main() -> Result<()> {
 
         #[cfg(unix)]
         Commands::ConnectUnix(args) => connect_unix(args).await,
+
+        Commands::MetricsServer(args) => metrics::run_metrics_server(&args.addr).anyerr(),
     };
     match res {
         Ok(()) => std::process::exit(0),

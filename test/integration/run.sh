@@ -219,16 +219,22 @@ m="$(scrape "$IMP" 9102 '^go_\|^rclone')"
 t "rclone mount metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
 m="$(scrape "$EXP" 9103 '^dumbpipe_connections_total')"
 t "dumbpipe listen metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
-m="$(scrape "$IMP" 9104 '^dumbpipe_connections_total')"
-t "dumbpipe connect metrics respond" "yes" "$([[ -n "$m" ]] && echo yes)"
-# with FSP_PROCS=2 the second tunnel process gets the next port
-m2="$(scrape "$IMP" 9105 '^dumbpipe_connections_total')"
-t "second tunnel metrics respond (9105)" "yes" "$([[ -n "$m2" ]] && echo yes)"
-# the importer's dumbpipe survived the whole run: it must have counted the
-# earlier transfers (8MB movie + parallel caps) as bytes from the peer
-bytes_from_peer="$(echo "$m" | awk '/^dumbpipe_bytes_from_peer_total /{print $2}')"
+# the receiver side is one central metrics server on 9104: both tunnel
+# processes push to it (pushes arrive within ~5s, covered by scrape retries)
+# and the merged exposition labels every sample with its proc
+m="$(scrape "$IMP" 9104 'proc="dp2"')"
+t "central metrics server responds with both tunnels" "yes" "$([[ -n "$m" ]] && echo yes)"
+t "metrics carry proc=dp1 label" "yes" "$(echo "$m" | grep -q 'proc="dp1"' && echo yes)"
+t "push freshness gauge present" "yes" "$(echo "$m" | grep -q '^dumbpipe_metrics_push_age_seconds{proc="dp1"}' && echo yes)"
+port9105=closed
+docker exec "$IMP" bash -c '(exec 3<>/dev/tcp/127.0.0.1/9105) 2>/dev/null' && port9105=open
+t "no per-process metrics port (9105 closed)" "closed" "$port9105"
+# the importer's tunnels survived the whole run: together they must have
+# counted the earlier transfers (8MB movie + parallel caps) as bytes from
+# the peer (values are per-proc samples now — sum them)
+bytes_from_peer="$(echo "$m" | awk '/^dumbpipe_bytes_from_peer_total[{ ]/{s+=$2} END{print s+0}')"
 t "dumbpipe counted transferred bytes (>1MB)" "yes" "$([[ "${bytes_from_peer:-0}" -gt 1000000 ]] && echo yes)"
-conns="$(echo "$m" | awk '/^dumbpipe_connections_total /{print $2}')"
+conns="$(echo "$m" | awk '/^dumbpipe_connections_total[{ ]/{s+=$2} END{print s+0}')"
 t "dumbpipe counted connections (>=1)" "yes" "$([[ "${conns:-0}" -ge 1 ]] && echo yes)"
 
 echo "== observability: stream logs =="

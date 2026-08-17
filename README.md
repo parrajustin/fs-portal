@@ -224,12 +224,14 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
   distributes file streams across them (each file open lands on a random
   tunnel, via an rclone union remote). Use it when a single tunnel process
   becomes the throughput or CPU bottleneck on big parallel reads. Default `1`
-  (single tunnel, identical to previous behavior). Notes: `FSP_MAX_STREAMS`
-  is enforced *per tunnel process* on the receiver (the transmitter still
-  enforces its own global cap), the extra tunnels use consecutive local ports
-  after `8081` in-container, and each extra process exposes metrics on the
-  next port after `9104`. The transmitter side needs no configuration — its
-  single listener accepts all tunnels.
+  (single tunnel, identical wire behavior). Notes: `FSP_MAX_STREAMS` is
+  enforced *per tunnel process* on the receiver (the transmitter still
+  enforces its own global cap), and the extra tunnels use consecutive local
+  ports after `8081` in-container. Metrics stay on **one** port regardless of
+  `FSP_PROCS`: every tunnel process pushes its counters to a central metrics
+  server on `9104`, which serves the merged, `proc="dpN"`-labeled exposition.
+  The transmitter side needs no configuration — its single listener accepts
+  all tunnels.
 - **Bounded bandwidth** (opt-in): `FSP_BWLIMIT` caps rclone's transfer rate
   on each side — the transmitter throttles what it serves into the tunnel,
   the receiver throttles its own reads of the peer (both verified against
@@ -267,7 +269,7 @@ default — add `ports:` to scrape from outside; `FSP_METRICS=0` disables all):
 | `9101` | rclone serve (transmitter) | rclone core + HTTP server metrics |
 | `9102` | rclone mount (receiver) | rclone VFS/cache/transfer metrics |
 | `9103` | dumbpipe listen (transmitter) | `dumbpipe_connections_total/active/closed`, `dumbpipe_bytes_{to,from}_peer_total`, `dumbpipe_connection_errors_total`, `dumbpipe_queue_waits_total`, `dumbpipe_stream_duration_ms_total` |
-| `9104` | dumbpipe connect (receiver) | same counters, receiver side; with `FSP_PROCS` > 1, tunnel *i* serves `9104 + i − 1` |
+| `9104` | dumbpipe metrics server (receiver) | same counters, receiver side — every tunnel process pushes to this one central server, samples labeled `proc="dpN"`, plus a `dumbpipe_metrics_push_age_seconds` freshness gauge per process |
 
 Scrape example (add to the fs-portal service: `ports: ["9101-9104:9101-9104"]`):
 
@@ -279,7 +281,8 @@ scrape_configs:
 ```
 
 Average stream speed in PromQL:
-`rate(dumbpipe_bytes_from_peer_total[5m])` (bytes/s), and
+`sum(rate(dumbpipe_bytes_from_peer_total[5m]))` (bytes/s; on the receiver
+endpoint the series are per tunnel process, `proc="dpN"`), and
 `dumbpipe_stream_duration_ms_total / 1000 / dumbpipe_connections_closed_total`
 for mean stream lifetime. An OpenTelemetry collector picks all of this up
 as-is (`prometheus` receiver for the four endpoints, `filelog`/docker
@@ -297,13 +300,13 @@ stays pinned.
 | `EXPORT_DIR` | `/export` | what you share (bind it `:ro`) |
 | `MOUNT_DIR` | `/portal/media` | where the peer's library appears |
 | `FSP_MAX_STREAMS` | `5` | max files streamed concurrently, enforced on both sides (`0` = unlimited); with `FSP_PROCS` > 1 this is per tunnel process |
-| `FSP_PROCS` | `1` | receiver-side parallel tunnel processes (1–64); file streams are distributed across them, each is its own iroh connection |
+| `FSP_PROCS` | `1` | receiver-side parallel tunnel processes (1–64); file streams are distributed across them, each is its own iroh connection; all push metrics to the single `:9104` server |
 | `FSP_BWLIMIT` | `off` | total rclone bandwidth cap per side, e.g. `10M` = 10 MiB/s; accepts `UP:DOWN` pairs and rclone timetables |
 | `FSP_VFS_CACHE_MAX_SIZE` | `2G` | local read cache for streaming |
 | `FSP_DIR_CACHE_TIME` | `30s` | how quickly new remote files appear |
 | `FSP_METRICS` | `1` | `0` disables all four Prometheus endpoints |
 | `FSP_SERVE_METRICS_PORT` / `FSP_MOUNT_METRICS_PORT` | `9101` / `9102` | rclone metrics ports |
-| `FSP_LISTEN_METRICS_PORT` / `FSP_CONNECT_METRICS_PORT` | `9103` / `9104` | dumbpipe metrics ports |
+| `FSP_LISTEN_METRICS_PORT` / `FSP_CONNECT_METRICS_PORT` | `9103` / `9104` | dumbpipe metrics ports (`9104` is the central server all tunnel processes push to) |
 | `FSP_RCLONE_LOG_LEVEL` | `INFO` | rclone log level (`DEBUG` for per-read detail) |
 | `FSP_STATS_INTERVAL` | `60s` | rclone mount transfer-stats log cadence |
 | `RUST_LOG` | `dumbpipe=info` | dumbpipe/tracing filter (`dumbpipe=debug`, `iroh=debug`) |

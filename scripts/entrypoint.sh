@@ -48,12 +48,10 @@ export RUST_LOG="${RUST_LOG:-dumbpipe=info}"
 #   9101 rclone serve   9102 rclone mount
 #   9103 dumbpipe listen (transmitter)   9104 dumbpipe connect (receiver)
 DP_LISTEN_METRICS=()
-CONNECT_METRICS_BASE="${FSP_CONNECT_METRICS_PORT:-9104}"
+CONNECT_METRICS_PORT="${FSP_CONNECT_METRICS_PORT:-9104}"
 if [[ "${FSP_METRICS:-1}" != 0 ]]; then
   DP_LISTEN_METRICS=(env "DUMBPIPE_METRICS_ADDR=0.0.0.0:${FSP_LISTEN_METRICS_PORT:-9103}")
-  connect_ports=":$CONNECT_METRICS_BASE"
-  [[ "$FSP_PROCS" -gt 1 ]] && connect_ports=":$CONNECT_METRICS_BASE-:$((CONNECT_METRICS_BASE + FSP_PROCS - 1))"
-  log "metrics: rclone :${FSP_SERVE_METRICS_PORT:-9101}(serve)/:${FSP_MOUNT_METRICS_PORT:-9102}(mount), dumbpipe :${FSP_LISTEN_METRICS_PORT:-9103}(listen)/${connect_ports}(connect) — publish the ports to scrape (FSP_METRICS=0 disables)"
+  log "metrics: rclone :${FSP_SERVE_METRICS_PORT:-9101}(serve)/:${FSP_MOUNT_METRICS_PORT:-9102}(mount), dumbpipe :${FSP_LISTEN_METRICS_PORT:-9103}(listen)/:${CONNECT_METRICS_PORT}(connect, all tunnels merged) — publish the ports to scrape (FSP_METRICS=0 disables)"
 else
   log "metrics: disabled (FSP_METRICS=0)"
 fi
@@ -176,13 +174,18 @@ if [[ " $ROLES_ACTIVE " == *" import "* ]]; then
   fusermount3 -uz "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
 
   log "import: bridging peer's webdav to 127.0.0.1:$FSP_IMPORT_PORT over iroh ($FSP_PROCS tunnel process(es))"
+  if [[ "${FSP_METRICS:-1}" != 0 ]]; then
+    # one central metrics server for every tunnel process: they push their
+    # labeled metrics to it and prometheus scrapes a single port
+    supervise dumbpipe-metrics dumbpipe metrics-server --addr "0.0.0.0:$CONNECT_METRICS_PORT"
+  fi
   for ((i = 1; i <= FSP_PROCS; i++)); do
     port=$((FSP_IMPORT_PORT + i - 1))
     name=dumbpipe-connect
     [[ "$FSP_PROCS" -gt 1 ]] && name="dumbpipe-connect-$i"
     connect_metrics=()
     if [[ "${FSP_METRICS:-1}" != 0 ]]; then
-      connect_metrics=(env "DUMBPIPE_METRICS_ADDR=0.0.0.0:$((CONNECT_METRICS_BASE + i - 1))")
+      connect_metrics=(env "DUMBPIPE_METRICS_PUSH_ADDR=127.0.0.1:$CONNECT_METRICS_PORT" "DUMBPIPE_METRICS_INSTANCE=dp$i")
     fi
     supervise "$name" "${connect_metrics[@]}" dumbpipe connect-tcp --addr "127.0.0.1:$port" --max-connections "$FSP_MAX_STREAMS" "$PEER_TICKET"
   done
