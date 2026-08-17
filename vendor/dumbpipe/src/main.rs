@@ -666,7 +666,10 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         forward_bidi(tcp_recv, tcp_send, endpoint_recv, endpoint_send).await?;
         Ok::<_, AnyError>(())
     }
-    let addr = args.ticket.endpoint_addr();
+    let addr = apply_addr_hints(
+        args.ticket.endpoint_addr().clone(),
+        std::env::var("DUMBPIPE_ADDR_HINTS").ok().as_deref(),
+    );
     let limiter = connection_limiter(args.max_connections);
     loop {
         // also wait for ctrl-c here so we can use it before accepting a connection
@@ -711,7 +714,18 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
     }
     let addr = endpoint.addr();
     let short = create_short_ticket(&addr);
-    let ticket = EndpointTicket::new(addr);
+    // Local addition (fs-portal): with DUMBPIPE_STABLE_TICKET=1 the primary
+    // ticket is the short one (endpoint id + relay only). The full ticket
+    // embeds this boot's ephemeral direct addresses, so its string changes on
+    // every restart; the short ticket is a stable function of the secret and
+    // relay config — the "fixed receiver" ticket fs-portal persists and the
+    // user hands out once. Connecting works the same: iroh dials via the
+    // relay and hole-punches the current direct path.
+    let ticket = if std::env::var("DUMBPIPE_STABLE_TICKET").as_deref() == Ok("1") {
+        short.clone()
+    } else {
+        EndpointTicket::new(addr)
+    };
 
     // print the ticket on stderr so it doesn't interfere with the data itself
     //
@@ -795,6 +809,30 @@ async fn listen_tcp(args: ListenTcpArgs) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Local addition (fs-portal): merge extra direct socket addresses from
+/// `DUMBPIPE_ADDR_HINTS` (comma-separated `ip:port`) into the address we
+/// dial. Stable tickets (DUMBPIPE_STABLE_TICKET) carry identity + relay
+/// only, so a peer that is actually on the local network can be reached
+/// instantly by handing its fresh direct address to the connect side
+/// out-of-band — without freezing ephemeral addresses into the ticket
+/// string. Invalid entries are logged and skipped.
+fn apply_addr_hints(mut addr: EndpointAddr, hints: Option<&str>) -> EndpointAddr {
+    for hint in hints
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        match hint.parse::<SocketAddr>() {
+            Ok(sa) => addr = addr.with_ip_addr(sa),
+            Err(e) => {
+                tracing::warn!("ignoring invalid DUMBPIPE_ADDR_HINTS entry {hint:?}: {e}")
+            }
+        }
+    }
+    addr
 }
 
 /// Creates a ticket that only includes the id and any relay urls
@@ -1067,5 +1105,30 @@ async fn main() -> Result<()> {
             eprintln!("error: {e}");
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod addr_hint_tests {
+    use super::*;
+
+    fn test_addr() -> EndpointAddr {
+        EndpointAddr::new(SecretKey::from_bytes(&[7u8; 32]).public())
+    }
+
+    #[test]
+    fn no_hints_leaves_addr_unchanged() {
+        let addr = test_addr();
+        assert_eq!(apply_addr_hints(addr.clone(), None), addr);
+        assert_eq!(apply_addr_hints(addr.clone(), Some("")), addr);
+    }
+
+    #[test]
+    fn hints_merge_and_junk_is_skipped() {
+        let out = apply_addr_hints(test_addr(), Some(" 10.0.0.5:4919, junk , 10.0.0.6:1 "));
+        let ips: Vec<String> = out.ip_addrs().map(|a| a.to_string()).collect();
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&"10.0.0.5:4919".to_string()));
+        assert!(ips.contains(&"10.0.0.6:1".to_string()));
     }
 }

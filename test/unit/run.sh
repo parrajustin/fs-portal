@@ -133,6 +133,16 @@ conf="$(FSP_IMPORT_PORT=9000 fsp_import_conf 3)"
 t "import conf honors port base" "yes" "$(printf '%s\n' "$conf" | grep -qx 'url = http://127.0.0.1:9002' && echo yes)"
 t "import conf unions all procs" "yes" "$(printf '%s\n' "$conf" | grep -qx 'upstreams = dp1: dp2: dp3:' && echo yes)"
 
+echo "== fsp_iroh_port =="
+t "empty defaults to 4919" "4919" "$(fsp_iroh_port "")"
+t "whitespace defaults to 4919" "4919" "$(fsp_iroh_port "  ")"
+t "explicit port passes through" "5000" "$(fsp_iroh_port "5000")"
+t "zero means random" "0" "$(fsp_iroh_port "0")"
+t "leading zeros normalized" "443" "$(fsp_iroh_port "0443")"
+fsp_iroh_port "65536" >/dev/null 2>&1; t "above 65535 rejected (rc)" 1 $?
+fsp_iroh_port "port" >/dev/null 2>&1; t "words rejected (rc)" 1 $?
+fsp_iroh_port "-1" >/dev/null 2>&1; t "negative rejected (rc)" 1 $?
+
 echo "== fsp_bwlimit =="
 t "empty defaults to off" "off" "$(fsp_bwlimit "")"
 t "whitespace defaults to off" "off" "$(fsp_bwlimit "  ")"

@@ -87,6 +87,25 @@ fsp_procs() {
   echo $((10#$raw))
 }
 
+# Normalize/validate FSP_IROH_PORT: the fixed UDP port the transmitter's
+# iroh endpoint binds. A predictable port lets same-LAN receivers dial
+# directly via FSP_PEER_ADDR hints (the stable ticket carries no addresses)
+# and makes firewall rules possible. Empty defaults to 4919; 0 = random
+# port. Echoes the normalized number; rc=1 on junk.
+fsp_iroh_port() {
+  local raw="${1-}"
+  raw="${raw//[[:space:]]/}"
+  if [[ -z "$raw" ]]; then
+    echo 4919
+    return 0
+  fi
+  if [[ ! "$raw" =~ ^[0-9]+$ ]] || ((10#$raw > 65535)); then
+    echo "fs-portal: FSP_IROH_PORT must be a UDP port number 0-65535 (0 = random), got '$1'" >&2
+    return 1
+  fi
+  echo $((10#$raw))
+}
+
 # Normalize/validate FSP_BWLIMIT: an rclone --bwlimit spec applied to rclone
 # on both sides (the transmitter's webdav serve and the receiver's FUSE
 # mount) so a bulk read can't saturate the link — and with it the CPU, since

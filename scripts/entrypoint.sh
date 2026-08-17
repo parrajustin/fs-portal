@@ -70,6 +70,11 @@ if [[ -z "${IROH_SECRET:-}" ]]; then
 fi
 fsp_is_valid_secret "$IROH_SECRET" || die "IROH_SECRET must be 64 hex chars (openssl rand -hex 32)"
 export IROH_SECRET
+# Stable ticket: the minted ticket embeds only the endpoint id + relay (both
+# stable functions of the secret + relay config), never this boot's ephemeral
+# socket addresses — so the exact ticket string survives restarts. Verified
+# by the integration "fixed receiver" test.
+export DUMBPIPE_STABLE_TICKET=1
 
 PIDS=()
 
@@ -103,7 +108,7 @@ supervise() { # supervise <name> <cmd...> — restart forever, prefix output
 supervise_listener() {
   (
     while true; do
-      "${DP_LISTEN_METRICS[@]}" dumbpipe listen-tcp --host "127.0.0.1:$FSP_WEBDAV_PORT" --max-connections "$FSP_MAX_STREAMS" 2>&1 | while IFS= read -r line; do
+      "${DP_LISTEN_METRICS[@]}" dumbpipe listen-tcp --host "127.0.0.1:$FSP_WEBDAV_PORT" --max-connections "$FSP_MAX_STREAMS" "${LISTEN_BIND[@]}" 2>&1 | while IFS= read -r line; do
         echo "[dumbpipe-listen] $line"
         ticket="$(printf '%s\n' "$line" | fsp_parse_ticket)"
         if [[ -n "$ticket" && "$(cat "$TICKET_FILE" 2>/dev/null)" != "$ticket" ]]; then
@@ -139,6 +144,12 @@ wait_for_port() { # wait_for_port <port> <seconds>
 # ---- export role ----------------------------------------------------------
 if [[ " $ROLES_ACTIVE " == *" export "* ]]; then
   [[ -d "$EXPORT_DIR" ]] || die "EXPORT_DIR $EXPORT_DIR is not mounted (bind your media library there, read-only)"
+  FSP_IROH_PORT="$(fsp_iroh_port "${FSP_IROH_PORT:-}")" || die "invalid FSP_IROH_PORT='${FSP_IROH_PORT:-}'"
+  LISTEN_BIND=()
+  if [[ "$FSP_IROH_PORT" != 0 ]]; then
+    LISTEN_BIND=(--ipv4-addr "0.0.0.0:$FSP_IROH_PORT")
+    log "export: iroh endpoint pinned to udp port $FSP_IROH_PORT (FSP_IROH_PORT; 0 = random) — a same-LAN receiver can dial it directly via FSP_PEER_ADDR"
+  fi
   mapfile -t serve_argv < <(fsp_serve_args)
   log "export: serving $EXPORT_DIR read-only via webdav on 127.0.0.1:$FSP_WEBDAV_PORT"
   supervise rclone-serve rclone "${serve_argv[@]}"
@@ -172,6 +183,15 @@ if [[ " $ROLES_ACTIVE " == *" import "* ]]; then
   mkdir -p "$MOUNT_DIR" "$FSP_CACHE_DIR"
   # clear any stale mount from an unclean shutdown
   fusermount3 -uz "$MOUNT_DIR" 2>/dev/null || umount -l "$MOUNT_DIR" 2>/dev/null || true
+
+  # Optional direct-address hint(s) for the peer, e.g. "192.168.1.20:4919"
+  # (comma-separable). The stable ticket carries identity + relay only; when
+  # the transmitter is on the local network, hinting its address here gives
+  # every tunnel an instant direct path instead of relay-first dialing.
+  if [[ -n "${FSP_PEER_ADDR:-}" ]]; then
+    export DUMBPIPE_ADDR_HINTS="$FSP_PEER_ADDR"
+    log "import: direct address hint(s) for the peer: $FSP_PEER_ADDR (FSP_PEER_ADDR)"
+  fi
 
   log "import: bridging peer's webdav to 127.0.0.1:$FSP_IMPORT_PORT over iroh ($FSP_PROCS tunnel process(es))"
   if [[ "${FSP_METRICS:-1}" != 0 ]]; then

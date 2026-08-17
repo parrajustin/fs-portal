@@ -204,8 +204,13 @@ exporter is `ROLES=export`, the importer `ROLES=import`).
   FUSE mount is `--read-only`, and your media is bound into fs-portal with
   `:ro`. Nobody can modify or delete your files through the portal.
 - **Fixed receiver**: node identity derives from `IROH_SECRET`; tickets never
-  expire or change. IPs, ISPs, and NATs can change freely — iroh rediscovers
-  the peer by node id.
+  expire or change — the minted ticket embeds only the stable identity and
+  relay, never the boot's ephemeral socket addresses, so the exact same
+  string is reprinted on every restart (integration-tested across secret
+  swaps). IPs, ISPs, and NATs can change freely — iroh rediscovers the peer
+  by node id. If both computers are on the *same* LAN, set `FSP_PEER_ADDR`
+  on the receiver to the transmitter's `lan-ip:4919` (and publish
+  `4919/udp`) for an instant direct path instead of relay-first dialing.
 - **Self-healing**: every process is supervised and restarts on failure;
   stale FUSE mounts are cleaned before remount; the `rslave` consumer bind
   means plex/jellyfin pick up a fresh mount after an fs-portal restart with
@@ -301,6 +306,8 @@ stays pinned.
 | `MOUNT_DIR` | `/portal/media` | where the peer's library appears |
 | `FSP_MAX_STREAMS` | `5` | max files streamed concurrently, enforced on both sides (`0` = unlimited); with `FSP_PROCS` > 1 this is per tunnel process |
 | `FSP_PROCS` | `1` | receiver-side parallel tunnel processes (1–64); file streams are distributed across them, each is its own iroh connection; all push metrics to the single `:9104` server |
+| `FSP_IROH_PORT` | `4919` | fixed UDP port the transmitter's iroh endpoint binds (`0` = random); predictable for firewall rules and `FSP_PEER_ADDR` |
+| `FSP_PEER_ADDR` | — | receiver-side direct address hint(s) for the peer, e.g. `192.168.1.20:4919` (comma-separable); gives same-LAN pairs an instant direct path since the stable ticket carries no addresses |
 | `FSP_BWLIMIT` | `off` | total rclone bandwidth cap per side, e.g. `10M` = 10 MiB/s; accepts `UP:DOWN` pairs and rclone timetables |
 | `FSP_VFS_CACHE_MAX_SIZE` | `2G` | local read cache for streaming |
 | `FSP_DIR_CACHE_TIME` | `30s` | how quickly new remote files appear |

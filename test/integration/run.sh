@@ -11,6 +11,7 @@ IMAGE="${IMAGE:-fs-portal:dev}"
 NET=fsp-int-net
 EXP=fsp-int-exporter
 IMP=fsp-int-importer
+IDC=fsp-int-identity
 # Docker Desktop only shares whitelisted host paths (e.g. $HOME) into its VM,
 # so the bind-mount fixtures must live under $HOME, not /tmp.
 FSP_WORK_ROOT="${FSP_WORK_ROOT:-$HOME/.cache/fs-portal-tests}"
@@ -24,7 +25,7 @@ t() { # t <name> <expected> <actual>
 }
 
 cleanup() {
-  docker rm -f "$EXP" "$IMP" >/dev/null 2>&1
+  docker rm -f "$EXP" "$IMP" "$IDC" >/dev/null 2>&1
   docker network rm "$NET" >/dev/null 2>&1
   rm -rf "$WORK"
 }
@@ -73,11 +74,17 @@ echo "== start importer =="
 # FSP_PROCS=2: two dumbpipe connect-tcp tunnel processes (ports 8081+8082),
 # rclone mounting the union of both — all the content checks below then run
 # through the multi-process path.
+# FSP_PEER_ADDR: the stable ticket carries no addresses, so hint the
+# exporter's direct address (container IP + pinned FSP_IROH_PORT) like a
+# same-LAN deployment would — otherwise every dial is relay-first, which is
+# slow and flaky from a single source IP.
+EXP_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$EXP")"
 docker run -d --name "$IMP" --network "$NET" --no-healthcheck \
   -e ROLES=import \
   -e PEER_TICKET="$TICKET" \
   -e FSP_MAX_STREAMS=3 \
   -e FSP_PROCS=2 \
+  -e FSP_PEER_ADDR="$EXP_IP:4919" \
   --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
   "$IMAGE" >/dev/null || { echo "FATAL: importer failed to start"; exit 1; }
 
@@ -242,6 +249,48 @@ logs="$(docker logs "$IMP" 2>&1)"
 t "stream start logged" "yes" "$(echo "$logs" | grep -q 'stream start' && echo yes)"
 t "stream close logged with speed" "yes" "$(echo "$logs" | grep -q 'stream closed' && echo yes)"
 t "rclone mount logs at INFO" "yes" "$(echo "$logs" | grep -q 'INFO' && echo yes)"
+
+echo "== fixed receiver: ticket is a pure function of IROH_SECRET =="
+# Cycle one transmitter through secrets A -> A -> B -> A across full
+# stop/starts (fresh container + fresh /config each time, so nothing but the
+# secret can carry the identity over) and compare the minted tickets:
+#   X (A) == Y (A restart); Z (B) differs from both; W (A again) == X.
+# The secrets deliberately contain hex digits outside the base32 alphabet
+# (0/1/8/9) so the ticket parser can never mistake a logged secret for a
+# ticket.
+SECRET_A="$(printf 'a0a1a8a9%.0s' 1 2 3 4 5 6 7 8)"
+SECRET_B="$(printf 'b0b1b8b9%.0s' 1 2 3 4 5 6 7 8)"
+
+start_identity() { # start_identity <secret> — stop the server, start with the given identity
+  docker rm -f "$IDC" >/dev/null 2>&1
+  docker run -d --name "$IDC" --network "$NET" --no-healthcheck \
+    -e ROLES=export \
+    -e IROH_SECRET="$1" \
+    -v "$WORK/media:/export:ro" \
+    "$IMAGE" >/dev/null || { echo "FATAL: identity transmitter failed to start"; exit 1; }
+}
+
+get_ticket() { # get_ticket <container> — wait for the ticket in this boot's logs
+  local i tk
+  for i in $(seq 1 60); do
+    tk="$(docker logs "$1" 2>&1 | grep -oE '[a-z2-7]{50,}' | head -n 1)"
+    [[ -n "$tk" ]] && { echo "$tk"; return 0; }
+    sleep 1
+  done
+  return 1
+}
+
+start_identity "$SECRET_A"; TX="$(get_ticket "$IDC")"
+t "secret A mints ticket X" "yes" "$([[ -n "$TX" ]] && echo yes)"
+start_identity "$SECRET_A"; TY="$(get_ticket "$IDC")"
+t "restart with secret A: Y == X" "$TX" "$TY"
+start_identity "$SECRET_B"; TZ="$(get_ticket "$IDC")"
+t "secret B mints ticket Z" "yes" "$([[ -n "$TZ" ]] && echo yes)"
+t "Z != Y" "different" "$([[ "$TZ" == "$TY" ]] && echo same || echo different)"
+t "Z != X" "different" "$([[ "$TZ" == "$TX" ]] && echo same || echo different)"
+start_identity "$SECRET_A"; TW="$(get_ticket "$IDC")"
+t "back to secret A: W == X" "$TX" "$TW"
+docker rm -f "$IDC" >/dev/null 2>&1
 
 echo
 echo "integration: $PASS passed, $FAIL failed"
